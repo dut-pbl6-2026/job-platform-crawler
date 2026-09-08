@@ -121,7 +121,13 @@ class VieclamSpider(scrapy.Spider):
 
     # -- JSON API ---------------------------------------------------------
     def parse_api(self, response: Response) -> Generator[Any, None, None]:
-        """Parse job-list JSON: data[] + pagination.total_pages, page while < MAX_PAGES."""
+        """Parse job-list JSON: data[] + pagination.total_pages, page while < MAX_PAGES.
+
+        NOTE: no spider contract here on purpose — the source API is POST-only
+        and built-in contracts can only issue GET (which returns 404). This path
+        is verified via manual live runs (`scrapy crawl vieclam -o output/live.json`,
+        see README) against tests/fixtures/vieclam_sample.json.
+        """
         try:
             payload = json.loads(response.text)
         except json.JSONDecodeError:
@@ -202,7 +208,17 @@ class VieclamSpider(scrapy.Spider):
 
     # -- HTML fallbacks (robots-allowed routes) ------------------------------
     def parse(self, response: Response) -> Generator[Any, None, None]:
-        """Parse /search/ listing: follow detail cards + next page (< MAX_PAGES)."""
+        """Parse /search/ listing: follow detail cards + next page (< MAX_PAGES).
+
+        @url https://vieclam.gov.vn/search/
+        @returns requests 1 1
+        @returns items 0 0
+
+        Bounds assume the current server-rendered shell: listings render
+        client-side, so no placeholder card matches (0 follows) and only the
+        placeholder pagination request is yielded. Update when refining the
+        HTML fallback selectors vs the rendered DOM.
+        """
         cards = response.css(self.CARD_SELECTOR)
         logger.debug("Listing page %s: %d cards found.", response.url, len(cards))
         for card in cards:
@@ -247,7 +263,16 @@ class VieclamSpider(scrapy.Spider):
         )
 
     def parse_job(self, response: Response) -> Generator[JobItem, None, None]:
-        """Parse /search/job-detail/ page into JobItem (None for missing fields)."""
+        """Parse /search/job-detail/ page into JobItem (None for missing fields).
+
+        @url https://vieclam.gov.vn/search/job-detail?id=388116
+        @returns items 1 1
+        @scrapes source_url title company location salary_raw description requirements category
+
+        Detail pages render client-side, so placeholder selectors find nothing
+        and fields stay None — the contract pins the JobItem shape (all keys
+        present), not values. Update bounds when refining selectors.
+        """
         base = response.meta.get("api_item", {})
         item = JobItem()
         item["source_url"] = response.url
