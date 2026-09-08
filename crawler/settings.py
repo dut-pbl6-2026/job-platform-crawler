@@ -35,6 +35,12 @@ HTTPCACHE_DIR = ".scrapy_cache"
 # Page limit (CRAWL-01-01): 10 = dev crawl (~100 jobs), 100 = full crawl (~1000 jobs)
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "10"))
 
+# API page size (items per page_num request)
+PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "20"))
+
+# Job group filter, mirrors ?nhom_tin_tuyen_dung= on /search/ (None = all groups)
+NHOM_TIN_TUYEN_DUNG = os.environ.get("NHOM_TIN_TUYEN_DUNG") or None
+
 # Pipeline chain (classes land in PR2: feature/crawler-pipelines)
 ITEM_PIPELINES = {
     "crawler.pipelines.CleaningPipeline": 100,
@@ -45,8 +51,11 @@ ITEM_PIPELINES = {
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
-# Target site base URL (public routes allowed by robots.txt: /search/, /search/job-detail/)
-CRAWLER_TARGET = os.environ.get("CRAWLER_TARGET", "https://vieclam.gov.vn")
+# Target site + JSON API base (no literal fallback: fail fast in spider
+# with a clear message when unset — AGENTS.md no-hard-coding rule).
+# Public routes allowed by robots.txt: /search/, /search/job-detail/.
+CRAWLER_TARGET = os.environ.get("CRAWLER_TARGET")
+CRAWLER_API_BASE = os.environ.get("CRAWLER_API_BASE")
 
 # Scrapy 2.13+: request fingerprinter defaults to 2.7, no override needed.
 FEED_EXPORT_ENCODING = "utf-8"

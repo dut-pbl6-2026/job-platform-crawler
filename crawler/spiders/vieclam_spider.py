@@ -1,18 +1,21 @@
 """VieclamSpider — crawl job listings from vieclam.gov.vn (CRAWL-01-01).
 
-Source strategy (in order):
-1. Public JSON API ``/api/svl/trang-chu/tin-tuyen-dung-noi-bat`` observed in the
-   site bundle (contract: ``data.data.content`` list, ``page_index``/``page_size``
-   params). Works only when the endpoint answers anonymous callers.
-2. HTML listing route ``/search/`` (allowed by robots.txt) with card selectors.
-3. Detail route ``/search/job-detail/`` for full description/requirements.
+Primary source: public JSON API (no auth needed, verified 2026-09-08):
+  POST {API_BASE}/api/svl/nld/vieclam?page_num=N&page_size=M
+  body: {"tencv": "", ...filter ids/null..., "nhom_tin_tuyen_dung": <int|null>}
+  response: {"success": true, "data": [...], "pagination": {"total_pages": N}}
 
-NOTE on selectors: vieclam.gov.vn renders listings client-side (SPA shell),
-so CSS/XPath below are documented placeholders. Refine them after inspecting
-the rendered DOM (browser DevTools) or when the JSON API is reachable with a
-token. The spider never raises on missing fields — they stay None (CRAWL-01-02).
+Field mapping mirrors the site frontend mapper (verified in site bundle):
+  id -> detail URL, vitri_td -> title, ten_ct -> company,
+  ten_tinh1 (+ten_tinh2) -> location, muc_luong -> salary_raw,
+  nganh_nghe -> category. The list API carries no description/requirements,
+  so those stay None here (cleaned/enriched in later stages).
 
-Stops after MAX_PAGES pages (CRAWL-01-01). Respects robots.txt via settings.
+Fallback: HTML routes /search/ and /search/job-detail/ (allowed by
+robots.txt). The site renders listings client-side, so HTML selectors below
+are documented placeholders — refine vs rendered DOM if fallback is needed.
+
+Stops after MAX_PAGES API pages (CRAWL-01-01). Respects robots.txt.
 """
 
 import json
@@ -27,17 +30,34 @@ from crawler.items import JobItem
 
 logger = logging.getLogger("crawler.spiders.vieclam")
 
+# POST body mirroring the site search form: empty keyword, no filters.
+# nhom_tin_tuyen_dung is injected per settings (None = all groups).
+SEARCH_BODY = {
+    "tencv": "",
+    "noi_lam_viec": None,
+    "nghe_lvid": None,
+    "chucvu_id": None,
+    "linh_vuc_lvid": None,
+    "kinh_nghiem_lvid": None,
+    "muc_luongid": None,
+    "hinh_thuc_lvid": None,
+    "quymo": None,
+    "kieu_dn": None,
+    "nld_id": None,
+    "getDataHistory": False,
+}
+
 
 class VieclamSpider(scrapy.Spider):
     name = "vieclam"
-    allowed_domains = ["vieclam.gov.vn"]
+    allowed_domains = ["vieclam.gov.vn", "api.vieclam.gov.vn"]
 
-    # Placeholder card selectors for /search/ listing (refine vs rendered DOM).
+    # Placeholder card selectors for /search/ fallback (refine vs rendered DOM).
     CARD_SELECTOR = "article.job-card, div.job-item, li.job-listing"
     CARD_LINK_SELECTOR = "a::attr(href)"
     NEXT_PAGE_SELECTOR = "a.next-page::attr(href), li.next a::attr(href)"
 
-    # Placeholder detail selectors for /search/job-detail/ (refine vs rendered DOM).
+    # Placeholder detail selectors for /search/job-detail/ fallback.
     SEL_TITLE = "h1::text"
     SEL_COMPANY = ".company-name::text, .employer-name::text"
     SEL_LOCATION = ".job-location::text, .location::text"
@@ -47,10 +67,13 @@ class VieclamSpider(scrapy.Spider):
     SEL_CATEGORY = ".job-category::text, .industry::text"
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # NOTE: kept as start_requests (not async start()) for Scrapy 2.11 compat.
         super().__init__(*args, **kwargs)
         self.max_pages: int = 10
         self.page_size: int = 20
-        self.target: str = "https://vieclam.gov.vn"
+        self.target: Optional[str] = None
+        self.api_base: Optional[str] = None
+        self.nhom_tin: Optional[int] = None
         self.page_count: int = 0
         self.item_count: int = 0
 
@@ -59,120 +82,115 @@ class VieclamSpider(scrapy.Spider):
         spider = super().from_crawler(crawler, *args, **kwargs)
         spider.max_pages = crawler.settings.getint("MAX_PAGES")
         spider.page_size = crawler.settings.getint("PAGE_SIZE", 20)
-        spider.target = str(crawler.settings.get("CRAWLER_TARGET"))
+        spider.target = crawler.settings.get("CRAWLER_TARGET")
+        spider.api_base = crawler.settings.get("CRAWLER_API_BASE")
+        nhom = crawler.settings.get("NHOM_TIN_TUYEN_DUNG")
+        spider.nhom_tin = int(nhom) if nhom not in (None, "") else None
+        if not spider.api_base:
+            raise RuntimeError(
+                "CRAWLER_API_BASE is not set. "
+                "Set it via .env (see .env.example) or -s CRAWLER_API_BASE=..."
+            )
         return spider
 
+    def _search_body(self) -> dict:
+        body = dict(SEARCH_BODY)
+        body["nhom_tin_tuyen_dung"] = self.nhom_tin
+        return body
+
+    def _search_url(self, page_num: int) -> str:
+        return (
+            f"{self.api_base}/api/svl/nld/vieclam"
+            f"?page_num={page_num}&page_size={self.page_size}"
+        )
+
     def start_requests(self) -> Generator[Request, None, None]:
-        # NOTE: kept as start_requests (not async start()) for Scrapy 2.11 compat.
-        logger.info("Spider opened. MAX_PAGES=%d", self.max_pages)
-        # 1. Public JSON API first (anonymous-friendly when available).
-        api_url = (
-            f"{self.target}/api/svl/trang-chu/tin-tuyen-dung-noi-bat"
-            f"?page_index=0&page_size={self.page_size}"
+        logger.info(
+            "Spider opened. MAX_PAGES=%d PAGE_SIZE=%d NHOM=%s",
+            self.max_pages,
+            self.page_size,
+            self.nhom_tin,
         )
         yield JsonRequest(
-            api_url,
+            self._search_url(1),
+            data=self._search_body(),
             callback=self.parse_api,
             errback=self.err_api,
-            meta={"page_index": 0},
-        )
-        # 2. HTML listing route (robots.txt: Allow /search/).
-        yield Request(
-            urljoin(self.target, "/search/"),
-            callback=self.parse,
-            errback=self.err_listing,
-            meta={"page": 1},
+            meta={"page_num": 1},
         )
 
     # -- JSON API ---------------------------------------------------------
     def parse_api(self, response: Response) -> Generator[Any, None, None]:
-        """Parse featured-jobs JSON: data.data.content list + pagination."""
-        if response.status in (401, 403):
-            logger.warning(
-                "JSON API unauthorized (status=%d). Falling back to HTML routes. URL: %s",
-                response.status,
-                response.url,
-            )
-            return
+        """Parse job-list JSON: data[] + pagination.total_pages, page while < MAX_PAGES."""
         try:
             payload = json.loads(response.text)
         except json.JSONDecodeError:
-            logger.warning("JSON API returned non-JSON body. URL: %s", response.url)
+            logger.warning("API returned non-JSON body. URL: %s", response.url)
             return
 
-        content = payload.get("data", {}).get("content", []) or []
-        if not content:
-            logger.warning("JSON API returned empty content. URL: %s", response.url)
+        entries = payload.get("data", []) or []
+        if not entries:
+            logger.warning("API returned empty data list. URL: %s", response.url)
             return
 
-        for entry in content:
-            item = self._api_entry_to_item(entry)
-            detail_url = self._api_detail_url(entry)
-            if detail_url:
-                yield Request(
-                    detail_url,
-                    callback=self.parse_job,
-                    errback=self.err_detail,
-                    meta={"api_item": dict(item)},
-                )
-            else:
-                self.item_count += 1
-                yield item
+        for entry in entries:
+            self.item_count += 1
+            yield self._api_entry_to_item(entry)
 
-        # Pagination over the API while under MAX_PAGES.
-        page_index = int(response.meta.get("page_index", 0))
-        self.page_count = max(self.page_count, page_index + 1)
-        if self.page_count < self.max_pages:
-            next_index = page_index + 1
-            next_url = (
-                f"{self.target}/api/svl/trang-chu/tin-tuyen-dung-noi-bat"
-                f"?page_index={next_index}"
-                f"&page_size={self.page_size}"
-            )
-            yield JsonRequest(
-                next_url,
-                callback=self.parse_api,
-                errback=self.err_api,
-                meta={"page_index": next_index},
-            )
-        else:
-            logger.info("MAX_PAGES=%d reached, stopping API pagination.", self.max_pages)
+        page_num = int(response.meta.get("page_num", 1))
+        self.page_count = max(self.page_count, page_num)
+        total_pages = ((payload.get("pagination") or {}).get("total_pages") or 0) or 0
+        logger.debug(
+            "API page %d/%s: %d entries (total items scraped: %d).",
+            page_num,
+            total_pages or "?",
+            len(entries),
+            self.item_count,
+        )
+
+        if self.page_count >= self.max_pages:
+            logger.info("MAX_PAGES=%d reached, stopping.", self.max_pages)
+            return
+        if total_pages and page_num >= total_pages:
+            logger.info("Last API page (%d) reached, stopping.", total_pages)
+            return
+        yield JsonRequest(
+            self._search_url(page_num + 1),
+            data=self._search_body(),
+            callback=self.parse_api,
+            errback=self.err_api,
+            meta={"page_num": page_num + 1},
+        )
 
     def _api_entry_to_item(self, entry: dict) -> JobItem:
-        """Map an API entry to JobItem defensively (keys vary by endpoint)."""
+        """Map API entry to JobItem (frontend mapper parity, None-safe)."""
         item = JobItem()
+        job_id = entry.get("id")
         item["source_url"] = (
-            entry.get("source_url")
-            or entry.get("sourceUrl")
-            or self._api_detail_url(entry)
+            f"{self.target}/search/job-detail?id={job_id}" if job_id else None
         )
-        item["title"] = entry.get("title") or entry.get("tieuDe")
-        item["company"] = entry.get("company") or entry.get("tenDoanhNghiep")
-        item["location"] = entry.get("location") or entry.get("diaDiem")
-        item["salary_raw"] = entry.get("salary_raw") or entry.get("mucluong")
-        item["description"] = entry.get("description") or entry.get("moTa")
-        item["requirements"] = entry.get("requirements") or entry.get("yeuCau")
-        item["category"] = entry.get("category") or entry.get("nganhNghe")
+        item["title"] = entry.get("vitri_td")
+        item["company"] = entry.get("ten_ct")
+        tinh1 = entry.get("ten_tinh1")
+        tinh2 = entry.get("ten_tinh2")
+        item["location"] = (
+            f"{tinh1}, {tinh2}" if tinh1 and tinh2 else (tinh1 or tinh2)
+        )
+        item["salary_raw"] = entry.get("muc_luong")
+        # List API carries no description/requirements (frontend falls back to
+        # title/[]); keep None per CRAWL-01-02 missing-field handling.
+        item["description"] = None
+        item["requirements"] = None
+        item["category"] = entry.get("nganh_nghe")
         return item
-
-    def _api_detail_url(self, entry: dict) -> Optional[str]:
-        direct = entry.get("detail_url") or entry.get("detailUrl")
-        if direct:
-            return urljoin(self.target, str(direct))
-        job_id = entry.get("id") or entry.get("jobId")
-        if job_id:
-            return urljoin(self.target, f"/search/job-detail/{job_id}")
-        return None
 
     def err_api(self, failure: Any) -> None:
         response = getattr(failure.value, "response", None)
         status = getattr(response, "status", None)
         url = getattr(response, "url", None) or failure.request.url
-        if status in (401, 403):
+        if status in (401, 403, 429):
             logger.warning(
-                "JSON API blocked (status=%d). Falling back to HTML routes. URL: %s",
-                status,
-                url,
+                "JSON API blocked (status=%d). URL: %s", status, url
             )
         else:
             logger.warning(
@@ -182,7 +200,7 @@ class VieclamSpider(scrapy.Spider):
                 failure.getErrorMessage(),
             )
 
-    # -- HTML listing ------------------------------------------------------
+    # -- HTML fallbacks (robots-allowed routes) ------------------------------
     def parse(self, response: Response) -> Generator[Any, None, None]:
         """Parse /search/ listing: follow detail cards + next page (< MAX_PAGES)."""
         cards = response.css(self.CARD_SELECTOR)
@@ -211,7 +229,7 @@ class VieclamSpider(scrapy.Spider):
         else:
             # Placeholder pagination param (refine vs real site behaviour).
             yield Request(
-                urljoin(self.target, f"/search/?page={page + 1}"),
+                urljoin(self.target or "", f"/search/?page={page + 1}"),
                 callback=self.parse,
                 errback=self.err_listing,
                 meta={"page": page + 1},
@@ -228,7 +246,6 @@ class VieclamSpider(scrapy.Spider):
             failure.getErrorMessage(),
         )
 
-    # -- HTML detail --------------------------------------------------------
     def parse_job(self, response: Response) -> Generator[JobItem, None, None]:
         """Parse /search/job-detail/ page into JobItem (None for missing fields)."""
         base = response.meta.get("api_item", {})
