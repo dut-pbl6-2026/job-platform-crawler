@@ -1,0 +1,32 @@
+[
+  {
+    "source_url": "https://vieclam.gov.vn/search/job-detail?id=388116",
+    "title": "Nha Quan Ly - Pho giam doc",
+    "company": "Cong ty TNHH Foogo Viet Nam",
+    "location": "Tinh Bac Ninh",
+    "salary_raw": "20 den 50 trieu",
+    "description": null,
+    "requirements": null,
+    "category": "Ky thuat vien may moc, cong cu"
+  },
+  {
+    "source_url": "https://vieclam.gov.vn/search/job-detail?id=387766",
+    "title": "Lao dong ky thuat",
+    "company": "Cong ty TNHH Foogo Viet Nam",
+    "location": "Tinh Bac Ninh, Tinh Quang Ninh",
+    "salary_raw": "10 den 20 trieu",
+    "description": null,
+    "requirements": null,
+    "category": "Van tai, kho bai"
+  },
+  {
+    "source_url": "https://vieclam.gov.vn/search/job-detail/111",
+    "title": "Ky su phan mem",
+    "company": "Cong ty TNHH ABC",
+    "location": "Da Nang",
+    "salary_raw": "10 - 20 trieu",
+    "description": "Mo ta cong viec",
+    "requirements": "Kinh nghiem 2 nam",
+    "category": "CNTT"
+  }
+]

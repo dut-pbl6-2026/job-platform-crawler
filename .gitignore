@@ -5,3 +5,11 @@ __pycache__/
 .env.bak.*
 mise.toml.local
 INFISICAL_TOKEN
+
+## Crawl outputs — never commit live dumps/logs (reproduce via
+## `scrapy crawl vieclam -o output/live.json`, see README)
+output/
+*.log
+*.jl
+.scrapy_cache/
+.scrapy/

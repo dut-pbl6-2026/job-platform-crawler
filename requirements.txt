@@ -1,0 +1,9 @@
+# Pinned minor versions per AGENTS.md (2026 best practice)
+# Scrapy 2.13: required for Python 3.14 + Twisted>=25 (2.11 imports a Twisted
+# private API removed upstream and cannot run the downloader here).
+scrapy==2.13.*
+psycopg2-binary==2.9.*
+elasticsearch==8.*
+python-dotenv==1.*
+ruff==0.4.*
+pytest==8.*

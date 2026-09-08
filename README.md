@@ -1,104 +1,64 @@
 # job-platform-crawler
 
-Web crawler for **Vietnam Job Platform** (`pbl6`) — `dut-pbl6-2026`. Extracts job listings from `vieclam.gov.vn`, cleans and deduplicates data, persists to PostgreSQL and syncs to Elasticsearch.
+Web crawler for **Vietnam Job Platform** (`pbl6`) — `dut-pbl6-2026`.
+Extracts job listings from `vieclam.gov.vn` (CRAWL-01-01).
 
-- Tech: Python 3.12, Scrapy 2.11
+- Tech: Python 3.14, Scrapy 2.13
 - Branch flow: `feature/* → main` (see `job-platform-docs/.github/git-strategy.md`)
-- Jira: Epic `PBL6-3` (Crawler & Data Seeding, 5 pts, Day Tue–Wed W4)
-- TM: TM1 Hoai, TM2 Thanh (Owner), TM3 Chi Bao, TM4 Khoa
+- Jira: Epic `PBL6-3` (Crawler & Data Seeding)
 
-## Overview
+## Spider: `vieclam` (CRAWL-01-01)
 
-- `crawler/spiders/vieclam_spider.py` — `VieclamSpider`: pagination crawl from `vieclam.gov.vn`, stops at `MAX_PAGES`
-- `crawler/pipelines.py` — `CleaningPipeline` > `DedupPipeline` > `PostgresPipeline` > `ElasticsearchPipeline`
-- `crawler/middlewares.py` — `BlockDetectionMiddleware`: detects 403/429 streaks, triggers seed fallback
-- `crawler/items.py` — `JobItem` schema
-- `crawler/settings.py` — Scrapy settings (throttle, retry, robots.txt, pipelines)
-- `scripts/seed_loader.py` — bulk-loads `seed/jobs.json` into PostgreSQL and Elasticsearch
-- `scripts/check_connectivity.py` — verifies PostgreSQL and Elasticsearch connections before crawling
-- `seed/jobs.json` — static seed dataset (100 records) for offline demo / blocked fallback
-- `tests/` — unit tests for spider parsing, pipelines, seed_loader
+Primary source is the public JSON API (no auth), HTML `/search/` routes are
+robots-allowed fallbacks (client-side rendered — selectors are placeholders).
 
-## Prerequisites
-
-- `mise` https://mise.jdx.dev
-- `docker` + `docker compose v2` (for local PostgreSQL and Elasticsearch)
-- `git` + `gh` (`gh auth login`)
-- Python 3.12 via `mise` — `mise trust && mise install`
-- `pip` packages installed via `mise run install`
-
-See `AGENTS.md` for shell activation (`mise activate`) and agent `mise exec` notes.
-
-## Clone
-
-```bash
-mkdir -p ~/projects/personal/job-platform && cd ~/projects/personal/job-platform
-for r in infra crawler; do gh repo clone dut-pbl6-2026/job-platform-$r; done
-cd job-platform-crawler
-```
+Field mapping mirrors the site frontend mapper: `vitri_td`→title,
+`ten_ct`→company, `ten_tinh1(+2)`→location, `muc_luong`→salary_raw,
+`nganh_nghe`→category,
+`source_url` = `https://vieclam.gov.vn/search/job-detail?id={id}`.
+The list API carries no description/requirements (stay `None`, CRAWL-01-02).
 
 ## Setup
 
 ```bash
-mise trust && mise install
-mise run install      # pip install -r requirements.txt
-mise run sync-env     # copy .env from ../job-platform-infra/envs/.env.dev.example
-mise run check-connectivity
+python -m venv .venv && .venv/Scripts/activate  # Windows
+pip install -r requirements.txt
+copy .env.example .env  # then fill values; never commit .env
 ```
 
-Env single source: `../job-platform-infra/envs/.env.dev.example` -> `.env` via `mise run sync-env`.
-
-Required env vars: `DATABASE_URL_CRAWLER`, `ELASTICSEARCH_URL`, `ELASTICSEARCH_INDEX`.
+Single source of truth for env values:
+`../job-platform-infra/envs/.env.dev.example`.
+Required: `CRAWLER_TARGET`, `CRAWLER_API_BASE`
+(`DATABASE_URL_CRAWLER` / `ELASTICSEARCH_*` land with PR2 pipelines).
 
 ## Run
 
-### Crawl (dev — 10 pages, ~100 jobs, HTTP cache enabled)
-
 ```bash
-mise run crawl-dev
+scrapy crawl vieclam -o output/live.json
+# knobs: MAX_PAGES=2 PAGE_SIZE=20 NHOM_TIN_TUYEN_DUNG=4 scrapy crawl vieclam -o output/live.json
 ```
 
-### Crawl (full — 100 pages, ~1000 jobs)
+`output/`, `*.log`, `*.jl` are git-ignored — **never commit live dumps**,
+reproduce with the command above. The only committed sample is the golden
+fixture `tests/fixtures/vieclam_sample.json` (see `tests/fixtures/README.md`).
+
+## Contracts (`scrapy check`)
+
+`parse` / `parse_job` carry `@url` / `@returns` / `@scrapes` contracts
+(HTML GET routes). `parse_api` is intentionally contract-free: the source
+API is POST-only and built-in contracts can only issue GET (verified 404) —
+it is covered by live runs instead. Pipelines land in PR2, so disable them
+for the check:
 
 ```bash
-mise run crawl
+scrapy check vieclam -s "ITEM_PIPELINES={}"
 ```
 
-### Seed fallback (load static seed/jobs.json into PG + ES)
+Needs `CRAWLER_TARGET` + `CRAWLER_API_BASE` (via `.env` or environment).
+
+## Lint & Test
 
 ```bash
-mise run seed
+ruff check crawler/ tests/
+pytest tests/ -v --tb=short   # from PR2 (pipelines) onwards
 ```
-
-## Lint, Format & Test
-
-```bash
-mise run lint       # ruff check crawler/ scripts/ tests/
-mise run format     # ruff format --check crawler/ scripts/ tests/
-mise run test       # pytest tests/ -v --tb=short
-mise run verify     # lint + format + test
-```
-
-## Verify data after crawl
-
-```bash
-# Count rows in PostgreSQL
-psql $DATABASE_URL_CRAWLER -c "SELECT COUNT(*) FROM crawled_jobs;"
-
-# Confirm no duplicates
-psql $DATABASE_URL_CRAWLER -c \
-  "SELECT COUNT(*) total, COUNT(DISTINCT source_url) unique_urls FROM crawled_jobs;"
-
-# Count indexed documents in Elasticsearch
-curl -s "$ELASTICSEARCH_URL/$ELASTICSEARCH_INDEX/_count"
-```
-
-## Troubleshooting
-
-- `python: command not found` -> `mise trust && mise install`
-- `PostgreSQL connection refused` -> start infra: `cd ../job-platform-infra && docker compose up -d`
-- `Elasticsearch connection refused` -> same docker compose, check `ELASTICSEARCH_URL` in `.env`
-- 403/429 rate-limiting from `vieclam.gov.vn` -> spider falls back to `mise run seed` automatically, or run manually
-- `mise run verify` fails -> re-run `mise run sync-env`
-
-`feature/* -> main` (see `job-platform-docs/.github/git-strategy.md`).
