@@ -48,6 +48,5 @@ LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 # Target site base URL (public routes allowed by robots.txt: /search/, /search/job-detail/)
 CRAWLER_TARGET = os.environ.get("CRAWLER_TARGET", "https://vieclam.gov.vn")
 
-REQUEST_FINGERPRINTER_IMPLEMENTATION = "2.7"
-TWISTED_REACTOR = "twisted.internet.asyncioreactor.AsyncioSelectorReactor"
+# Scrapy 2.13+: request fingerprinter defaults to 2.7, no override needed.
 FEED_EXPORT_ENCODING = "utf-8"

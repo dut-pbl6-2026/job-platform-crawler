@@ -63,6 +63,7 @@ class VieclamSpider(scrapy.Spider):
         return spider
 
     def start_requests(self) -> Generator[Request, None, None]:
+        # NOTE: kept as start_requests (not async start()) for Scrapy 2.11 compat.
         logger.info("Spider opened. MAX_PAGES=%d", self.max_pages)
         # 1. Public JSON API first (anonymous-friendly when available).
         api_url = (
@@ -164,7 +165,22 @@ class VieclamSpider(scrapy.Spider):
         return None
 
     def err_api(self, failure: Any) -> None:
-        logger.warning("JSON API request failed: %s", failure.getErrorMessage())
+        response = getattr(failure.value, "response", None)
+        status = getattr(response, "status", None)
+        url = getattr(response, "url", None) or failure.request.url
+        if status in (401, 403):
+            logger.warning(
+                "JSON API blocked (status=%d). Falling back to HTML routes. URL: %s",
+                status,
+                url,
+            )
+        else:
+            logger.warning(
+                "JSON API request failed (status=%s). URL: %s Error: %s",
+                status,
+                url,
+                failure.getErrorMessage(),
+            )
 
     # -- HTML listing ------------------------------------------------------
     def parse(self, response: Response) -> Generator[Any, None, None]:
@@ -202,7 +218,15 @@ class VieclamSpider(scrapy.Spider):
             )
 
     def err_listing(self, failure: Any) -> None:
-        logger.warning("Listing request failed: %s", failure.getErrorMessage())
+        response = getattr(failure.value, "response", None)
+        status = getattr(response, "status", None)
+        url = getattr(response, "url", None) or failure.request.url
+        logger.warning(
+            "Listing request failed (status=%s). URL: %s Error: %s",
+            status,
+            url,
+            failure.getErrorMessage(),
+        )
 
     # -- HTML detail --------------------------------------------------------
     def parse_job(self, response: Response) -> Generator[JobItem, None, None]:
