@@ -1,8 +1,11 @@
 # job-platform-crawler
-Python Scrapy — part of **Vietnam Job Platform** (`pbl6`) under [`dut-pbl6-2026`](https://github.com/dut-pbl6-2026).
-- Tech: Python Scrapy
-- Branch flow: `feature/* → main`
-- Jira PBL6 skid.atlassian.net
+
+Web crawler for **Vietnam Job Platform** (`pbl6`) — `dut-pbl6-2026`.
+Extracts job listings from `vieclam.gov.vn` (CRAWL-01-01).
+
+- Tech: Python 3.14, Scrapy 2.13
+- Branch flow: `feature/* → main` (see `job-platform-docs/.github/git-strategy.md`)
+- Jira: Epic `PBL6-3` (Crawler & Data Seeding)
 
 ## Spider: `vieclam` (CRAWL-01-01)
 
@@ -15,10 +18,22 @@ Field mapping mirrors the site frontend mapper: `vitri_td`→title,
 `source_url` = `https://vieclam.gov.vn/search/job-detail?id={id}`.
 The list API carries no description/requirements (stay `None`, CRAWL-01-02).
 
+## Setup
+
+```bash
+python -m venv .venv && .venv/Scripts/activate  # Windows
+pip install -r requirements.txt
+copy .env.example .env  # then fill values; never commit .env
+```
+
+Single source of truth for env values:
+`../job-platform-infra/envs/.env.dev.example`.
+Required: `CRAWLER_TARGET`, `CRAWLER_API_BASE`
+(`DATABASE_URL_CRAWLER` / `ELASTICSEARCH_*` land with PR2 pipelines).
+
 ## Run
 
 ```bash
-cp ../job-platform-infra/envs/.env.dev.example .env  # or copy .env.example
 scrapy crawl vieclam -o output/live.json
 # knobs: MAX_PAGES=2 PAGE_SIZE=20 NHOM_TIN_TUYEN_DUNG=4 scrapy crawl vieclam -o output/live.json
 ```
@@ -31,12 +46,19 @@ fixture `tests/fixtures/vieclam_sample.json` (see `tests/fixtures/README.md`).
 
 `parse` / `parse_job` carry `@url` / `@returns` / `@scrapes` contracts
 (HTML GET routes). `parse_api` is intentionally contract-free: the source
-API is POST-only and built-in contracts can only issue GET (404) — it is
-covered by live runs instead. Pipelines land in PR2, so disable them for
-the check:
+API is POST-only and built-in contracts can only issue GET (verified 404) —
+it is covered by live runs instead. Pipelines land in PR2, so disable them
+for the check:
 
 ```bash
 scrapy check vieclam -s "ITEM_PIPELINES={}"
 ```
 
 Needs `CRAWLER_TARGET` + `CRAWLER_API_BASE` (via `.env` or environment).
+
+## Lint & Test
+
+```bash
+ruff check crawler/ tests/
+pytest tests/ -v --tb=short   # from PR2 (pipelines) onwards
+```
