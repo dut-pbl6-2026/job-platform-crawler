@@ -1,0 +1,7 @@
+# Pinned minor versions per AGENTS.md (2026 best practice)
+scrapy==2.11.*
+psycopg2-binary==2.9.*
+elasticsearch==8.*
+python-dotenv==1.*
+ruff==0.4.*
+pytest==8.*
