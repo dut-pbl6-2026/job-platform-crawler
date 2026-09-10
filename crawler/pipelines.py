@@ -9,11 +9,14 @@ Pipeline chain (priorities defined in settings.py):
 
 import html
 import logging
+import os
 import re
 from html.parser import HTMLParser
 
+import psycopg2
+import psycopg2.extras
 from itemadapter import ItemAdapter
-from scrapy.exceptions import DropItem
+from scrapy.exceptions import DropItem, NotConfigured
 
 logger = logging.getLogger("crawler.pipelines")
 
@@ -207,3 +210,101 @@ class DedupPipeline:
             raise DropItem(f"Duplicate URL: {url}")
         self.seen_urls.add(url)
         return item
+
+
+# ---------------------------------------------------------------------------
+# SQL DDL for crawled_jobs table (CRAWL-01-04)
+# ---------------------------------------------------------------------------
+
+_CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS crawled_jobs (
+    id              SERIAL       PRIMARY KEY,
+    source_url      TEXT         NOT NULL UNIQUE,
+    title           VARCHAR(256) NOT NULL,
+    company         VARCHAR(256),
+    location        VARCHAR(256),
+    salary_raw      VARCHAR(256),
+    salary_min      BIGINT,
+    salary_max      BIGINT,
+    salary_currency VARCHAR(10)  DEFAULT 'VND',
+    description     TEXT,
+    requirements    TEXT,
+    category        VARCHAR(128),
+    crawled_at      TIMESTAMPTZ  DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_crawled_jobs_category ON crawled_jobs(category);
+CREATE INDEX IF NOT EXISTS idx_crawled_jobs_location ON crawled_jobs(location);
+"""
+
+_UPSERT_SQL = """
+INSERT INTO crawled_jobs
+  (source_url, title, company, location, salary_raw, salary_min, salary_max,
+   salary_currency, description, requirements, category)
+VALUES (%(source_url)s, %(title)s, %(company)s, %(location)s, %(salary_raw)s,
+        %(salary_min)s, %(salary_max)s, %(salary_currency)s,
+        %(description)s, %(requirements)s, %(category)s)
+ON CONFLICT (source_url) DO UPDATE SET
+  title       = EXCLUDED.title,
+  updated_at  = NOW()
+RETURNING id;
+"""
+
+# ---------------------------------------------------------------------------
+# PostgresPipeline (priority 300)  -- CRAWL-01-04
+# ---------------------------------------------------------------------------
+
+
+class PostgresPipeline:
+    """Upsert items into PostgreSQL crawled_jobs table (CRAWL-01-04)."""
+
+    def open_spider(self, spider) -> None:  # type: ignore[override]
+        database_url = os.environ.get("DATABASE_URL_CRAWLER")
+        if not database_url:
+            raise NotConfigured("DATABASE_URL_CRAWLER is not set.")
+        self.conn = psycopg2.connect(database_url)
+        self.conn.autocommit = False
+        with self.conn.cursor() as cur:
+            cur.execute(_CREATE_TABLE_SQL)
+        self.conn.commit()
+        logger.info("PostgresPipeline opened. Table crawled_jobs ready.")
+
+    def process_item(self, item: dict, spider) -> dict:  # type: ignore[override]
+        adapter = ItemAdapter(item)
+        params = {
+            "source_url": adapter.get("source_url"),
+            "title": adapter.get("title") or "",
+            "company": adapter.get("company"),
+            "location": adapter.get("location"),
+            "salary_raw": adapter.get("salary_raw"),
+            "salary_min": adapter.get("salary_min"),
+            "salary_max": adapter.get("salary_max"),
+            "salary_currency": adapter.get("salary_currency", "VND"),
+            "description": adapter.get("description"),
+            "requirements": adapter.get("requirements"),
+            "category": adapter.get("category"),
+        }
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(_UPSERT_SQL, params)
+                row = cur.fetchone()
+                pg_id = row[0] if row else None
+            self.conn.commit()
+            adapter["pg_id"] = pg_id
+        except Exception as exc:  # noqa: BLE001
+            self.conn.rollback()
+            logger.error(
+                "PostgreSQL upsert failed. source_url=%s Error: %s",
+                params.get("source_url"),
+                exc,
+            )
+            raise DropItem(f"DB upsert failed: {exc}") from exc
+        return item
+
+    def close_spider(self, spider) -> None:  # type: ignore[override]
+        if self.conn and not self.conn.closed:
+            try:
+                self.conn.commit()
+            finally:
+                self.conn.close()
+        logger.info("PostgresPipeline closed.")
