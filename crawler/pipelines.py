@@ -13,6 +13,7 @@ import re
 from html.parser import HTMLParser
 
 from itemadapter import ItemAdapter
+from scrapy.exceptions import DropItem
 
 logger = logging.getLogger("crawler.pipelines")
 
@@ -180,4 +181,29 @@ class CleaningPipeline:
         adapter["salary_max"] = salary_max
         adapter["salary_currency"] = "VND"
 
+        return item
+
+
+# ---------------------------------------------------------------------------
+# DedupPipeline (priority 200)  -- CRAWL-01-03
+# ---------------------------------------------------------------------------
+
+
+class DedupPipeline:
+    """In-memory dedup by source_url per spider run (CRAWL-01-03).
+
+    DB-level UNIQUE constraint on source_url is the cross-run safety net.
+    """
+
+    def open_spider(self, spider) -> None:  # type: ignore[override]
+        self.seen_urls: set[str] = set()
+
+    def process_item(self, item: dict, spider) -> dict:  # type: ignore[override]
+        adapter = ItemAdapter(item)
+        url: str = adapter.get("source_url") or ""
+        if not url:
+            raise DropItem("Missing source_url -- cannot dedup.")
+        if url in self.seen_urls:
+            raise DropItem(f"Duplicate URL: {url}")
+        self.seen_urls.add(url)
         return item
