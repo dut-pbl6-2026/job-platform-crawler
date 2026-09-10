@@ -154,6 +154,44 @@ def _normalize_location(loc: str | None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# SQL DDL for crawled_jobs table (CRAWL-01-04)
+# ---------------------------------------------------------------------------
+
+_CREATE_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS crawled_jobs (
+    id              SERIAL       PRIMARY KEY,
+    source_url      TEXT         NOT NULL UNIQUE,
+    title           VARCHAR(256) NOT NULL,
+    company         VARCHAR(256),
+    location        VARCHAR(256),
+    salary_raw      VARCHAR(256),
+    salary_min      BIGINT,
+    salary_max      BIGINT,
+    salary_currency VARCHAR(10)  DEFAULT 'VND',
+    description     TEXT,
+    requirements    TEXT,
+    category        VARCHAR(128),
+    crawled_at      TIMESTAMPTZ  DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_crawled_jobs_category ON crawled_jobs(category);
+CREATE INDEX IF NOT EXISTS idx_crawled_jobs_location ON crawled_jobs(location);
+"""
+
+_UPSERT_SQL = """
+INSERT INTO crawled_jobs
+  (source_url, title, company, location, salary_raw, salary_min, salary_max,
+   salary_currency, description, requirements, category)
+VALUES (%(source_url)s, %(title)s, %(company)s, %(location)s, %(salary_raw)s,
+        %(salary_min)s, %(salary_max)s, %(salary_currency)s,
+        %(description)s, %(requirements)s, %(category)s)
+ON CONFLICT (source_url) DO UPDATE SET
+  title       = EXCLUDED.title,
+  updated_at  = NOW()
+RETURNING id;
+"""
+
+# ---------------------------------------------------------------------------
 # CleaningPipeline (priority 100)  -- CRAWL-01-02
 # ---------------------------------------------------------------------------
 
@@ -213,44 +251,6 @@ class DedupPipeline:
 
 
 # ---------------------------------------------------------------------------
-# SQL DDL for crawled_jobs table (CRAWL-01-04)
-# ---------------------------------------------------------------------------
-
-_CREATE_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS crawled_jobs (
-    id              SERIAL       PRIMARY KEY,
-    source_url      TEXT         NOT NULL UNIQUE,
-    title           VARCHAR(256) NOT NULL,
-    company         VARCHAR(256),
-    location        VARCHAR(256),
-    salary_raw      VARCHAR(256),
-    salary_min      BIGINT,
-    salary_max      BIGINT,
-    salary_currency VARCHAR(10)  DEFAULT 'VND',
-    description     TEXT,
-    requirements    TEXT,
-    category        VARCHAR(128),
-    crawled_at      TIMESTAMPTZ  DEFAULT NOW(),
-    updated_at      TIMESTAMPTZ  DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_crawled_jobs_category ON crawled_jobs(category);
-CREATE INDEX IF NOT EXISTS idx_crawled_jobs_location ON crawled_jobs(location);
-"""
-
-_UPSERT_SQL = """
-INSERT INTO crawled_jobs
-  (source_url, title, company, location, salary_raw, salary_min, salary_max,
-   salary_currency, description, requirements, category)
-VALUES (%(source_url)s, %(title)s, %(company)s, %(location)s, %(salary_raw)s,
-        %(salary_min)s, %(salary_max)s, %(salary_currency)s,
-        %(description)s, %(requirements)s, %(category)s)
-ON CONFLICT (source_url) DO UPDATE SET
-  title       = EXCLUDED.title,
-  updated_at  = NOW()
-RETURNING id;
-"""
-
-# ---------------------------------------------------------------------------
 # PostgresPipeline (priority 300)  -- CRAWL-01-04
 # ---------------------------------------------------------------------------
 
@@ -308,3 +308,105 @@ class PostgresPipeline:
             finally:
                 self.conn.close()
         logger.info("PostgresPipeline closed.")
+
+
+# ---------------------------------------------------------------------------
+# ElasticsearchPipeline (priority 400)  -- CRAWL-01-05
+# ---------------------------------------------------------------------------
+
+_ES_MAPPING = {
+    "mappings": {
+        "properties": {
+            "title": {"type": "text"},
+            "company": {"type": "keyword"},
+            "location": {"type": "keyword"},
+            "salary_min": {"type": "long"},
+            "salary_max": {"type": "long"},
+            "salary_currency": {"type": "keyword"},
+            "description": {"type": "text"},
+            "requirements": {"type": "text"},
+            "category": {"type": "keyword"},
+            "source_url": {"type": "keyword"},
+            "crawled_at": {"type": "date"},
+        }
+    }
+}
+
+
+class ElasticsearchPipeline:
+    """Index items into Elasticsearch jobs index after PG upsert (CRAWL-01-05).
+
+    ES failure logs warning but does NOT abort crawl (best-effort sync).
+    """
+
+    def open_spider(self, spider) -> None:  # type: ignore[override]
+        es_url = os.environ.get("ELASTICSEARCH_URL")
+        self.es_index = os.environ.get("ELASTICSEARCH_INDEX", "jobs")
+        if not es_url:
+            logger.warning(
+                "ELASTICSEARCH_URL is not set. Elasticsearch indexing disabled."
+            )
+            self.es = None
+            return
+        try:
+            from elasticsearch import Elasticsearch
+
+            self.es = Elasticsearch([es_url])
+            if not self.es.ping():
+                raise ConnectionError("Elasticsearch ping failed.")
+            if not self.es.indices.exists(index=self.es_index):
+                self.es.indices.create(index=self.es_index, body=_ES_MAPPING)
+                logger.info("ElasticsearchPipeline: created index '%s'.", self.es_index)
+            else:
+                logger.info(
+                    "ElasticsearchPipeline opened. Index '%s' ready.", self.es_index
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ElasticsearchPipeline: connection failed (%s). Indexing disabled.", exc
+            )
+            self.es = None
+
+    def process_item(self, item: dict, spider) -> dict:  # type: ignore[override]
+        if self.es is None:
+            title = ItemAdapter(item).get("title", "")
+            logger.warning(
+                "Elasticsearch unavailable. Skipping index for item: %s", title
+            )
+            return item
+        adapter = ItemAdapter(item)
+        pg_id = adapter.get("pg_id")
+        doc = {
+            "title": adapter.get("title"),
+            "company": adapter.get("company"),
+            "location": adapter.get("location"),
+            "salary_min": adapter.get("salary_min"),
+            "salary_max": adapter.get("salary_max"),
+            "salary_currency": adapter.get("salary_currency", "VND"),
+            "description": adapter.get("description"),
+            "requirements": adapter.get("requirements"),
+            "category": adapter.get("category"),
+            "source_url": adapter.get("source_url"),
+            "crawled_at": None,
+        }
+        try:
+            self.es.index(
+                index=self.es_index,
+                id=str(pg_id) if pg_id is not None else None,
+                document=doc,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Elasticsearch index failed for item '%s': %s",
+                adapter.get("title"),
+                exc,
+            )
+        return item
+
+    def close_spider(self, spider) -> None:  # type: ignore[override]
+        if self.es is not None:
+            try:
+                self.es.indices.refresh(index=self.es_index)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Elasticsearch refresh failed: %s", exc)
+        logger.info("ElasticsearchPipeline closed.")
