@@ -1,0 +1,39 @@
+[tasks.install]
+run = "pip install -r requirements.txt"
+description = "Install Python dependencies"
+
+[tasks.sync-env]
+run = "cp ../job-platform-infra/envs/.env.dev.example .env"
+description = "Sync env from infra"
+
+[tasks.check-connectivity]
+run = "python scripts/check_connectivity.py"
+description = "Verify PG and ES connections"
+
+[tasks.crawl-dev]
+run = "scrapy crawl vieclam -s MAX_PAGES=10 -s HTTPCACHE_ENABLED=True -s LOG_LEVEL=INFO"
+description = "Dev crawl: 10 pages (~100 jobs), HTTP cache enabled"
+
+[tasks.crawl]
+run = "scrapy crawl vieclam -s MAX_PAGES=100 -s LOG_LEVEL=INFO"
+description = "Full crawl: 100 pages (~1000 jobs)"
+
+[tasks.seed]
+run = "python scripts/seed_loader.py"
+description = "Load seed/jobs.json into PG + ES"
+
+[tasks.lint]
+run = "ruff check crawler/ scripts/ tests/"
+description = "Lint check"
+
+[tasks.format]
+run = "ruff format --check crawler/ scripts/ tests/"
+description = "Format check"
+
+[tasks.test]
+run = "pytest tests/ -v --tb=short"
+description = "Run all unit tests"
+
+[tasks.verify]
+run = "mise run lint && mise run format && mise run test"
+description = "Full verification before PR"
