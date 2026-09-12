@@ -51,6 +51,14 @@ ITEM_PIPELINES = {
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
 
+# Downloader middlewares — BlockDetectionMiddleware (CRAWL-01-07)
+DOWNLOADER_MIDDLEWARES = {
+    "crawler.middlewares.BlockDetectionMiddleware": 543,
+}
+
+# Number of consecutive 403/429 responses that triggers seed fallback
+BLOCK_DETECTION_THRESHOLD = int(os.environ.get("BLOCK_DETECTION_THRESHOLD", "5"))
+
 # Target site + JSON API base (no literal fallback: fail fast in spider
 # with a clear message when unset — AGENTS.md no-hard-coding rule).
 # Public routes allowed by robots.txt: /search/, /search/job-detail/.
