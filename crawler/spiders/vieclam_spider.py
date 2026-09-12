@@ -179,9 +179,7 @@ class VieclamSpider(scrapy.Spider):
         item["company"] = entry.get("ten_ct")
         tinh1 = entry.get("ten_tinh1")
         tinh2 = entry.get("ten_tinh2")
-        item["location"] = (
-            f"{tinh1}, {tinh2}" if tinh1 and tinh2 else (tinh1 or tinh2)
-        )
+        item["location"] = f"{tinh1}, {tinh2}" if tinh1 and tinh2 else (tinh1 or tinh2)
         item["salary_raw"] = entry.get("muc_luong")
         # List API carries no description/requirements (frontend falls back to
         # title/[]); keep None per CRAWL-01-02 missing-field handling.
@@ -195,9 +193,7 @@ class VieclamSpider(scrapy.Spider):
         status = getattr(response, "status", None)
         url = getattr(response, "url", None) or failure.request.url
         if status in (401, 403, 429):
-            logger.warning(
-                "JSON API blocked (status=%d). URL: %s", status, url
-            )
+            logger.warning("JSON API blocked (status=%d). URL: %s", status, url)
         else:
             logger.warning(
                 "JSON API request failed (status=%s). URL: %s Error: %s",
@@ -231,7 +227,9 @@ class VieclamSpider(scrapy.Spider):
         page = int(response.meta.get("page", 1))
         self.page_count = max(self.page_count, page)
         if self.page_count >= self.max_pages:
-            logger.info("MAX_PAGES=%d reached, stopping listing pagination.", self.max_pages)
+            logger.info(
+                "MAX_PAGES=%d reached, stopping listing pagination.", self.max_pages
+            )
             return
 
         next_href = response.css(self.NEXT_PAGE_SELECTOR).get()
@@ -277,12 +275,24 @@ class VieclamSpider(scrapy.Spider):
         item = JobItem()
         item["source_url"] = response.url
         item["title"] = base.get("title") or self._first_text(response, self.SEL_TITLE)
-        item["company"] = base.get("company") or self._first_text(response, self.SEL_COMPANY)
-        item["location"] = base.get("location") or self._first_text(response, self.SEL_LOCATION)
-        item["salary_raw"] = base.get("salary_raw") or self._first_text(response, self.SEL_SALARY)
-        item["description"] = base.get("description") or self._all_text(response, self.SEL_DESCRIPTION)
-        item["requirements"] = base.get("requirements") or self._all_text(response, self.SEL_REQUIREMENTS)
-        item["category"] = base.get("category") or self._first_text(response, self.SEL_CATEGORY)
+        item["company"] = base.get("company") or self._first_text(
+            response, self.SEL_COMPANY
+        )
+        item["location"] = base.get("location") or self._first_text(
+            response, self.SEL_LOCATION
+        )
+        item["salary_raw"] = base.get("salary_raw") or self._first_text(
+            response, self.SEL_SALARY
+        )
+        item["description"] = base.get("description") or self._all_text(
+            response, self.SEL_DESCRIPTION
+        )
+        item["requirements"] = base.get("requirements") or self._all_text(
+            response, self.SEL_REQUIREMENTS
+        )
+        item["category"] = base.get("category") or self._first_text(
+            response, self.SEL_CATEGORY
+        )
         self.item_count += 1
         logger.debug("Scraped item #%d: %s", self.item_count, item.get("title"))
         yield item
@@ -307,9 +317,7 @@ class VieclamSpider(scrapy.Spider):
     @staticmethod
     def _all_text(response: Response, selector: str) -> Optional[str]:
         for sel in selector.split(","):
-            parts = [
-                t.strip() for t in response.css(sel.strip()).getall() if t.strip()
-            ]
+            parts = [t.strip() for t in response.css(sel.strip()).getall() if t.strip()]
             if parts:
                 return " ".join(parts)
         return None
