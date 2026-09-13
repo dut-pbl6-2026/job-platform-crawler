@@ -2,6 +2,7 @@
 
 Web crawler for **Vietnam Job Platform** (`pbl6`) — `dut-pbl6-2026`.
 Extracts job listings from `vieclam.gov.vn` (CRAWL-01-01).
+Target: **500+ deduplicated jobs** in PostgreSQL + Elasticsearch (Day Wed milestone).
 
 - Tech: Python 3.14, Scrapy 2.13
 - Branch flow: `feature/* → main` (see `job-platform-docs/.github/git-strategy.md`)
@@ -37,6 +38,26 @@ Required: `CRAWLER_TARGET`, `CRAWLER_API_BASE`
 scrapy crawl vieclam -o output/live.json
 # knobs: MAX_PAGES=2 PAGE_SIZE=20 NHOM_TIN_TUYEN_DUNG=4 scrapy crawl vieclam -o output/live.json
 ```
+
+## Quick Start — 500+ Jobs (Day Wed milestone)
+
+```bash
+python scripts/check_connectivity.py
+scrapy crawl vieclam -s MAX_PAGES=50 -s LOG_LEVEL=INFO  # or: mise run crawl-500
+python scripts/verify_500.py                            # or: mise run verify-500
+```
+
+Cross-run dedup check: run `crawl-500` twice, then `verify-500` again —
+`total == unique_urls` (upsert, no new rows). If blocked (403/429),
+`python scripts/seed_loader.py` loads the 550-record `seed/jobs.json`
+fallback into PG + ES.
+
+| Mise task | Command | Use case |
+|:----------|:--------|:---------|
+| `crawl-dev` | `scrapy crawl vieclam -s MAX_PAGES=10 ...` | Dev/test nhanh (~100 jobs) |
+| `crawl-500` | `scrapy crawl vieclam -s MAX_PAGES=50 ...` | Day Wed target (~500+ jobs) |
+| `crawl` | `scrapy crawl vieclam -s MAX_PAGES=100 ...` | Full production crawl (~1000 jobs) |
+| `verify-500` | `python scripts/verify_500.py` | Verify 500+ dedup in PG + ES |
 
 `output/`, `*.log`, `*.jl` are git-ignored — **never commit live dumps**,
 reproduce with the command above. The only committed sample is the golden

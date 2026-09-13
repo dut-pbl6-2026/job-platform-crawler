@@ -1,10 +1,17 @@
 """Unit tests for CleaningPipeline and DedupPipeline (CRAWL-01-02, CRAWL-01-03)."""
 
+from unittest.mock import MagicMock, patch
+
 import pytest
 from scrapy.exceptions import DropItem
 
 from crawler.items import JobItem
-from crawler.pipelines import CleaningPipeline, DedupPipeline
+from crawler.pipelines import (
+    CleaningPipeline,
+    DedupPipeline,
+    ElasticsearchPipeline,
+    PostgresPipeline,
+)
 
 
 def make_item(**overrides) -> JobItem:
@@ -84,3 +91,53 @@ def test_dedup_missing_url_raises():
     pipe.open_spider(spider=None)
     with pytest.raises(DropItem):
         pipe.process_item(make_item(source_url=None), spider=None)
+
+
+def make_pg_conn():
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_cursor.__enter__.return_value = mock_cursor
+    mock_cursor.__exit__.return_value = False
+    mock_cursor.fetchone.return_value = [1]
+    mock_conn.cursor.return_value = mock_cursor
+    mock_conn.closed = False
+    return mock_conn
+
+
+def test_postgres_batch_commit_flushes_every_50():
+    mock_conn = make_pg_conn()
+    with patch("psycopg2.connect", return_value=mock_conn):
+        pipe = PostgresPipeline()
+        pipe.open_spider(spider=None)
+        for i in range(55):
+            pipe.process_item(
+                make_item(source_url=f"https://vieclam.gov.vn/seed/{i}"),
+                spider=None,
+            )
+        # open commit + 1 batch commit at 50 items
+        assert mock_conn.commit.call_count == 2
+        pipe.close_spider(spider=None)
+        # close flushes remaining 5 items
+        assert mock_conn.commit.call_count == 3
+        assert mock_conn.close.called
+
+
+def test_elasticsearch_bulk_flushes_every_50():
+    mock_es = MagicMock()
+    mock_es.ping.return_value = True
+    mock_es.indices.exists.return_value = True
+    with patch("elasticsearch.Elasticsearch", return_value=mock_es):
+        pipe = ElasticsearchPipeline()
+        pipe.open_spider(spider=None)
+        pipe.es = mock_es
+        with patch("elasticsearch.helpers.bulk", return_value=(50, [])) as mock_bulk:
+            for i in range(55):
+                item = make_item(source_url=f"https://vieclam.gov.vn/seed/{i}")
+                item["pg_id"] = i
+                pipe.process_item(item, spider=None)
+            assert mock_bulk.call_count == 1
+            assert len(pipe._buffer) == 5
+            pipe.close_spider(spider=None)
+            assert mock_bulk.call_count == 2
+            assert len(pipe._buffer) == 0
+            assert mock_es.indices.refresh.called
