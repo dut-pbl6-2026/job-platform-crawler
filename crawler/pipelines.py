@@ -290,32 +290,72 @@ class PostgresPipeline:
         }
         try:
             with self.conn.cursor() as cur:
-                cur.execute(_UPSERT_SQL, params)
-                row = cur.fetchone()
+                cur.execute("SAVEPOINT crawler_batch")
+                try:
+                    cur.execute(_UPSERT_SQL, params)
+                    row = cur.fetchone()
+                except Exception as exc:
+                    try:
+                        cur.execute("ROLLBACK TO SAVEPOINT crawler_batch")
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+                    logger.error(
+                        "PostgreSQL upsert failed. source_url=%s Error: %s",
+                        params.get("source_url"),
+                        exc,
+                    )
+                    raise DropItem(f"DB upsert failed: {exc}") from exc
+                try:
+                    cur.execute("RELEASE SAVEPOINT crawler_batch")
+                except Exception:  # noqa: BLE001, S110
+                    pass
                 pg_id = row[0] if row else None
-            adapter["pg_id"] = pg_id
-            self._batch_count += 1
-            self._total_count += 1
-            if self._batch_count >= self.BATCH_SIZE:
-                self.conn.commit()
-                logger.info(
-                    "PostgresPipeline batch commit. %d items flushed.", self.BATCH_SIZE
-                )
-                self._batch_count = 0
+        except DropItem:
+            raise
         except Exception as exc:  # noqa: BLE001
-            self.conn.rollback()
+            try:
+                self.conn.rollback()
+            except Exception:  # noqa: BLE001, S110
+                pass
+            self._batch_count = 0
             logger.error(
-                "PostgreSQL upsert failed. source_url=%s Error: %s",
+                "PostgreSQL cursor failed. source_url=%s Error: %s",
                 params.get("source_url"),
                 exc,
             )
             raise DropItem(f"DB upsert failed: {exc}") from exc
+        adapter["pg_id"] = pg_id
+        self._batch_count += 1
+        self._total_count += 1
+        if self._batch_count >= self.BATCH_SIZE:
+            try:
+                self.conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    self.conn.rollback()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+                self._total_count = max(0, self._total_count - self.BATCH_SIZE)
+                self._batch_count = 0
+                logger.error("PostgreSQL batch commit failed: %s", exc)
+                raise DropItem(f"DB batch commit failed: {exc}") from exc
+            logger.info(
+                "PostgresPipeline batch commit. %d items flushed.", self.BATCH_SIZE
+            )
+            self._batch_count = 0
         return item
 
     def close_spider(self, spider) -> None:  # type: ignore[override]
         if getattr(self, "conn", None) is not None and not self.conn.closed:
             try:
-                self.conn.commit()
+                try:
+                    self.conn.commit()
+                except Exception as exc:  # noqa: BLE001
+                    try:
+                        self.conn.rollback()
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+                    logger.error("PostgreSQL final commit failed: %s", exc)
             finally:
                 self.conn.close()
         logger.info(
@@ -419,24 +459,59 @@ class ElasticsearchPipeline:
         return item
 
     def _flush_buffer(self) -> None:
-        """Bulk index buffered documents via elasticsearch.helpers.bulk."""
+        """Bulk index buffered documents via elasticsearch.helpers.bulk.
+
+        Failed actions are retained in the buffer for retry with the next
+        batch instead of being discarded (PG/ES count parity).
+        """
         buffer = getattr(self, "_buffer", [])
         if not buffer or getattr(self, "es", None) is None:
             return
+        pending = list(buffer)
         try:
             from elasticsearch.helpers import bulk
 
-            success, errors = bulk(self.es, buffer, raise_on_error=False)
+            success, errors = bulk(self.es, pending, raise_on_error=False)
             logger.info("ElasticsearchPipeline bulk indexed %d documents.", success)
             if errors:
-                logger.warning("ElasticsearchPipeline bulk errors: %d", len(errors))
+                failed_ids: set[str] = set()
+                for err in errors:
+                    if isinstance(err, dict):
+                        for op in ("index", "create", "update"):
+                            detail = err.get(op)
+                            if (
+                                isinstance(detail, dict)
+                                and detail.get("_id") is not None
+                            ):
+                                failed_ids.add(str(detail.get("_id")))
+                failed = (
+                    [a for a in pending if str(a.get("_id")) in failed_ids]
+                    if failed_ids
+                    else pending
+                )
+                logger.warning(
+                    "ElasticsearchPipeline bulk errors: %d. %d docs retained.",
+                    len(errors),
+                    len(failed),
+                )
+                buffer.clear()
+                buffer.extend(failed)
+            else:
+                buffer.clear()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("Elasticsearch bulk index failed: %s", exc)
-        finally:
-            buffer.clear()
+            logger.warning(
+                "Elasticsearch bulk index failed: %s. %d docs retained for retry.",
+                exc,
+                len(buffer),
+            )
 
     def close_spider(self, spider) -> None:  # type: ignore[override]
         self._flush_buffer()
+        remaining = len(getattr(self, "_buffer", []))
+        if remaining:
+            logger.warning(
+                "ElasticsearchPipeline closed with %d unindexed docs.", remaining
+            )
         if getattr(self, "es", None) is not None:
             try:
                 self.es.indices.refresh(index=self.es_index)

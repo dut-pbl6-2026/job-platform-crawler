@@ -25,7 +25,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s %(name)s: %(message)s",
 )
-logger = logging.getLogger("verify_500")
+logger = logging.getLogger("crawler.scripts.verify_500")
 
 TARGET_COUNT = 500
 

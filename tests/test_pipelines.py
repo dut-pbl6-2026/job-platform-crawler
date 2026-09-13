@@ -141,3 +141,84 @@ def test_elasticsearch_bulk_flushes_every_50():
             assert mock_bulk.call_count == 2
             assert len(pipe._buffer) == 0
             assert mock_es.indices.refresh.called
+
+
+def test_postgres_item_failure_rolls_back_to_savepoint_only():
+    mock_conn = make_pg_conn()
+    mock_cursor = mock_conn.cursor.return_value
+
+    def fail_on_bad_url(sql, params=None):
+        if isinstance(params, dict) and params.get("source_url") == "bad":
+            raise RuntimeError("upsert boom")
+        return None
+
+    mock_cursor.execute.side_effect = fail_on_bad_url
+    with patch("psycopg2.connect", return_value=mock_conn):
+        pipe = PostgresPipeline()
+        pipe.open_spider(spider=None)
+        pipe.process_item(make_item(source_url="good-1"), spider=None)
+        with pytest.raises(DropItem):
+            pipe.process_item(make_item(source_url="bad"), spider=None)
+        # Item failure rolls back to savepoint, never a full transaction rollback.
+        assert mock_conn.rollback.call_count == 0
+        executed = [c.args[0] for c in mock_cursor.execute.call_args_list]
+        assert "ROLLBACK TO SAVEPOINT crawler_batch" in executed
+        # Prior good item is preserved in the open batch.
+        assert pipe._batch_count == 1
+        pipe.process_item(make_item(source_url="good-2"), spider=None)
+        assert pipe._batch_count == 2
+
+
+def test_postgres_batch_commit_failure_resets_batch():
+    mock_conn = make_pg_conn()
+    mock_conn.commit.side_effect = [None, RuntimeError("commit boom")]
+    with patch("psycopg2.connect", return_value=mock_conn):
+        pipe = PostgresPipeline()
+        pipe.open_spider(spider=None)
+        with pytest.raises(DropItem):
+            for i in range(50):
+                pipe.process_item(
+                    make_item(source_url=f"https://vieclam.gov.vn/seed/{i}"),
+                    spider=None,
+                )
+        assert pipe._batch_count == 0
+        assert mock_conn.rollback.called
+
+
+def test_elasticsearch_bulk_exception_retains_buffer_for_retry():
+    mock_es = MagicMock()
+    mock_es.ping.return_value = True
+    mock_es.indices.exists.return_value = True
+    with patch("elasticsearch.Elasticsearch", return_value=mock_es):
+        pipe = ElasticsearchPipeline()
+        pipe.open_spider(spider=None)
+        pipe.es = mock_es
+        for i in range(2):
+            item = make_item(source_url=f"https://vieclam.gov.vn/seed/{i}")
+            item["pg_id"] = i
+            pipe.process_item(item, spider=None)
+        with patch("elasticsearch.helpers.bulk", side_effect=RuntimeError("es down")):
+            pipe._flush_buffer()
+        assert len(pipe._buffer) == 2
+        with patch("elasticsearch.helpers.bulk", return_value=(2, [])):
+            pipe._flush_buffer()
+        assert len(pipe._buffer) == 0
+
+
+def test_elasticsearch_bulk_partial_errors_requeue_failed_only():
+    mock_es = MagicMock()
+    mock_es.ping.return_value = True
+    mock_es.indices.exists.return_value = True
+    with patch("elasticsearch.Elasticsearch", return_value=mock_es):
+        pipe = ElasticsearchPipeline()
+        pipe.open_spider(spider=None)
+        pipe.es = mock_es
+        for i in range(2):
+            item = make_item(source_url=f"https://vieclam.gov.vn/seed/{i}")
+            item["pg_id"] = i
+            pipe.process_item(item, spider=None)
+        errors = [{"index": {"_id": "1", "status": 400, "error": "bad doc"}}]
+        with patch("elasticsearch.helpers.bulk", return_value=(1, errors)):
+            pipe._flush_buffer()
+        assert len(pipe._buffer) == 1
+        assert pipe._buffer[0]["_id"] == "1"

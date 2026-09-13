@@ -21,6 +21,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("crawler.scripts.generate_seed")
 
+# Stable fixture namespace for seed URLs (implementation plan 2.3).
+# This is committed fixture data, not runtime config: CRAWLER_TARGET
+# configures live crawl routes, while seed URLs must stay stable so
+# seed_loader upserts remain idempotent across runs.
+SEED_URL_BASE = "https://vieclam.gov.vn"
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_SEED_PATH = str(_REPO_ROOT / "seed" / "jobs.json")
 
@@ -130,7 +136,7 @@ def generate_record(index: int, rng: random.Random) -> dict:
     location = rng.choice(LOCATIONS)
     salary_min, salary_max = rng.choice(SALARY_RANGES)
     return {
-        "source_url": f"https://vieclam.gov.vn/seed/{index}",
+        "source_url": f"{SEED_URL_BASE}/seed/{index}",
         "title": title,
         "company": company,
         "location": location,
