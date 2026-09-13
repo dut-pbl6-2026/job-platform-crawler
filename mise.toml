@@ -18,6 +18,14 @@ description = "Dev crawl: 10 pages (~100 jobs), HTTP cache enabled"
 run = "scrapy crawl vieclam -s MAX_PAGES=100 -s LOG_LEVEL=INFO"
 description = "Full crawl: 100 pages (~1000 jobs)"
 
+[tasks.crawl-500]
+run = "scrapy crawl vieclam -s MAX_PAGES=50 -s LOG_LEVEL=INFO"
+description = "Scale crawl: 50 pages (~500+ jobs), Day Wed target"
+
+[tasks.verify-500]
+run = "python scripts/verify_500.py"
+description = "Verify 500+ dedup jobs in PG + ES (Day Wed milestone)"
+
 [tasks.seed]
 run = "python scripts/seed_loader.py"
 description = "Load seed/jobs.json into PG + ES"
