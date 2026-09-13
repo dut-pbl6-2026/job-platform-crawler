@@ -258,6 +258,8 @@ class DedupPipeline:
 class PostgresPipeline:
     """Upsert items into PostgreSQL crawled_jobs table (CRAWL-01-04)."""
 
+    BATCH_SIZE = 50
+
     def open_spider(self, spider) -> None:  # type: ignore[override]
         database_url = os.environ.get("DATABASE_URL_CRAWLER")
         if not database_url:
@@ -267,6 +269,8 @@ class PostgresPipeline:
         with self.conn.cursor() as cur:
             cur.execute(_CREATE_TABLE_SQL)
         self.conn.commit()
+        self._batch_count = 0
+        self._total_count = 0
         logger.info("PostgresPipeline opened. Table crawled_jobs ready.")
 
     def process_item(self, item: dict, spider) -> dict:  # type: ignore[override]
@@ -289,8 +293,15 @@ class PostgresPipeline:
                 cur.execute(_UPSERT_SQL, params)
                 row = cur.fetchone()
                 pg_id = row[0] if row else None
-            self.conn.commit()
             adapter["pg_id"] = pg_id
+            self._batch_count += 1
+            self._total_count += 1
+            if self._batch_count >= self.BATCH_SIZE:
+                self.conn.commit()
+                logger.info(
+                    "PostgresPipeline batch commit. %d items flushed.", self.BATCH_SIZE
+                )
+                self._batch_count = 0
         except Exception as exc:  # noqa: BLE001
             self.conn.rollback()
             logger.error(
@@ -302,12 +313,15 @@ class PostgresPipeline:
         return item
 
     def close_spider(self, spider) -> None:  # type: ignore[override]
-        if self.conn and not self.conn.closed:
+        if getattr(self, "conn", None) is not None and not self.conn.closed:
             try:
                 self.conn.commit()
             finally:
                 self.conn.close()
-        logger.info("PostgresPipeline closed.")
+        logger.info(
+            "PostgresPipeline closed. Total items: %d.",
+            getattr(self, "_total_count", 0),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -337,11 +351,15 @@ class ElasticsearchPipeline:
     """Index items into Elasticsearch jobs index after PG upsert (CRAWL-01-05).
 
     ES failure logs warning but does NOT abort crawl (best-effort sync).
+    Documents are buffered and indexed via helpers.bulk every BULK_SIZE items.
     """
+
+    BULK_SIZE = 50
 
     def open_spider(self, spider) -> None:  # type: ignore[override]
         es_url = os.environ.get("ELASTICSEARCH_URL")
         self.es_index = os.environ.get("ELASTICSEARCH_INDEX", "jobs")
+        self._buffer: list[dict] = []
         if not es_url:
             logger.warning(
                 "ELASTICSEARCH_URL is not set. Elasticsearch indexing disabled."
@@ -389,22 +407,37 @@ class ElasticsearchPipeline:
             "source_url": adapter.get("source_url"),
             "crawled_at": None,
         }
-        try:
-            self.es.index(
-                index=self.es_index,
-                id=str(pg_id) if pg_id is not None else None,
-                document=doc,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Elasticsearch index failed for item '%s': %s",
-                adapter.get("title"),
-                exc,
-            )
+        self._buffer.append(
+            {
+                "_index": self.es_index,
+                "_id": str(pg_id) if pg_id is not None else None,
+                "_source": doc,
+            }
+        )
+        if len(self._buffer) >= self.BULK_SIZE:
+            self._flush_buffer()
         return item
 
+    def _flush_buffer(self) -> None:
+        """Bulk index buffered documents via elasticsearch.helpers.bulk."""
+        buffer = getattr(self, "_buffer", [])
+        if not buffer or getattr(self, "es", None) is None:
+            return
+        try:
+            from elasticsearch.helpers import bulk
+
+            success, errors = bulk(self.es, buffer, raise_on_error=False)
+            logger.info("ElasticsearchPipeline bulk indexed %d documents.", success)
+            if errors:
+                logger.warning("ElasticsearchPipeline bulk errors: %d", len(errors))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Elasticsearch bulk index failed: %s", exc)
+        finally:
+            buffer.clear()
+
     def close_spider(self, spider) -> None:  # type: ignore[override]
-        if self.es is not None:
+        self._flush_buffer()
+        if getattr(self, "es", None) is not None:
             try:
                 self.es.indices.refresh(index=self.es_index)
             except Exception as exc:  # noqa: BLE001
