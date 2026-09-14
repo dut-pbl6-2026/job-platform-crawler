@@ -56,6 +56,11 @@ DOWNLOADER_MIDDLEWARES = {
     "crawler.middlewares.BlockDetectionMiddleware": 543,
 }
 
+# Extensions — crawl summary stats (Day Wed scale-up)
+EXTENSIONS = {
+    "crawler.extensions.CrawlStatsExtension": 500,
+}
+
 # Number of consecutive 403/429 responses that triggers seed fallback
 BLOCK_DETECTION_THRESHOLD = int(os.environ.get("BLOCK_DETECTION_THRESHOLD", "5"))
 
