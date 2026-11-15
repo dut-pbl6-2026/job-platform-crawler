@@ -1,0 +1,15 @@
+{
+  "success": true,
+  "pagination": {"total_pages": 1},
+  "data": [
+    {"id": 101, "vitri_td": "Ky su phan mem", "ten_ct": "Cong ty TNHH ABC",
+     "ten_tinh1": "Ha Noi", "ten_tinh2": null, "muc_luong": "5,5 - 7 triệu",
+     "nganh_nghe": "CNTT"},
+    {"id": 102, "vitri_td": "Lap trinh vien Python", "ten_ct": "Cong ty CP XYZ",
+     "ten_tinh1": "Ho Chi Minh", "ten_tinh2": "Binh Duong", "muc_luong": "20 den 50 trieu",
+     "nganh_nghe": "CNTT"},
+    {"id": 101, "vitri_td": "Ky su phan mem (ban sao)", "ten_ct": "Cong ty TNHH ABC",
+     "ten_tinh1": "Ha Noi", "ten_tinh2": null, "muc_luong": "5,5 - 7 triệu",
+     "nganh_nghe": "CNTT"}
+  ]
+}

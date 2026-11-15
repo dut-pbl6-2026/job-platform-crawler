@@ -1,8 +1,14 @@
 name: ci
 on: { push: { branches: [main] }, pull_request: { branches: [main] } }
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: echo "ci"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install -r requirements.txt
+      - run: ruff check crawler/ scripts/ tests/
+      - run: ruff format --check crawler/ scripts/ tests/
+      - run: pytest tests/ -v --tb=short

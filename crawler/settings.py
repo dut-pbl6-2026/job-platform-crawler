@@ -26,6 +26,11 @@ USER_AGENT = "PBL6-JobPlatform-Crawler/1.0 (+https://github.com/dut-pbl6-2026)"
 RETRY_ENABLED = True
 RETRY_TIMES = 3
 RETRY_HTTP_CODES = [500, 502, 503, 504, 408, 429]
+# Network errors are retried by BlockDetectionMiddleware with exponential
+# backoff, not by RetryMiddleware (which retries without delay). They are
+# never counted as blocks (CRAWL-01-07).
+RETRY_EXCEPTIONS: list[str] = []
+NETWORK_RETRY_BACKOFF = float(os.environ.get("NETWORK_RETRY_BACKOFF", "2"))
 
 # HTTPCACHE only in development (never in production)
 SCRAPY_ENV = os.environ.get("SCRAPY_ENV", "development")

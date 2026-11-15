@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from scrapy.exceptions import DropItem
 
+from crawler.es_document import job_doc_id
 from crawler.items import JobItem
 from crawler.pipelines import (
     CleaningPipeline,
@@ -12,6 +13,13 @@ from crawler.pipelines import (
     ElasticsearchPipeline,
     PostgresPipeline,
 )
+
+
+@pytest.fixture(autouse=True)
+def _pipeline_env(monkeypatch):
+    """Pipelines read their config from the environment; never depend on a local .env."""
+    monkeypatch.setenv("DATABASE_URL_CRAWLER", "postgresql://test/db")
+    monkeypatch.delenv("ELASTICSEARCH_URL", raising=False)
 
 
 def make_item(**overrides) -> JobItem:
@@ -217,8 +225,9 @@ def test_elasticsearch_bulk_partial_errors_requeue_failed_only():
             item = make_item(source_url=f"https://vieclam.gov.vn/seed/{i}")
             item["pg_id"] = i
             pipe.process_item(item, spider=None)
-        errors = [{"index": {"_id": "1", "status": 400, "error": "bad doc"}}]
+        failed_id = job_doc_id("https://vieclam.gov.vn/seed/1")
+        errors = [{"index": {"_id": failed_id, "status": 400, "error": "bad doc"}}]
         with patch("elasticsearch.helpers.bulk", return_value=(1, errors)):
             pipe._flush_buffer()
         assert len(pipe._buffer) == 1
-        assert pipe._buffer[0]["_id"] == "1"
+        assert pipe._buffer[0]["_id"] == failed_id
