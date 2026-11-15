@@ -4,7 +4,8 @@ Pipeline chain (priorities defined in settings.py):
   CleaningPipeline (100)      -> strip HTML, normalize salary/location
   DedupPipeline    (200)      -> in-memory dedup per run by source_url
   PostgresPipeline (300)      -> upsert into crawled_jobs (pg_id kept on item)
-  ElasticsearchPipeline (400) -> index doc into ES jobs index (best-effort)
+  KafkaJobEventPipeline (400) -> publish job.external.upserted to Kafka (best-effort);
+                                search-svc indexes it into the ES jobs index
 """
 
 import html
@@ -19,10 +20,16 @@ from typing import Any
 
 import psycopg2
 import psycopg2.extras
+from confluent_kafka import Producer
 from itemadapter import ItemAdapter
 from scrapy.exceptions import DropItem, NotConfigured
 
-from crawler.es_document import build_es_doc, index_exists
+from crawler.es_document import index_exists
+from crawler.job_events import (
+    DEFAULT_TOPIC,
+    JobEventPublisher,
+    producer_config_from_env,
+)
 
 logger = logging.getLogger("crawler.pipelines")
 
@@ -415,123 +422,87 @@ class PostgresPipeline:
 
 
 # ---------------------------------------------------------------------------
-# ElasticsearchPipeline (priority 400)  -- CRAWL-01-05
+# KafkaJobEventPipeline (priority 400)  -- CRAWL-01-05
 # ---------------------------------------------------------------------------
 
 
-class ElasticsearchPipeline:
-    """Index items into Elasticsearch jobs index after PG upsert (CRAWL-01-05).
+class KafkaJobEventPipeline:
+    """Publish crawled jobs to the Kafka job-events topic for search-svc (CRAWL-01-05).
 
-    ES failure logs warning but does NOT abort crawl (best-effort sync).
-    Documents are buffered and indexed via helpers.bulk every BULK_SIZE items.
+    Replaces the direct Elasticsearch write: search-svc consumes each
+    `job.external.upserted` event and indexes it under the same id (sha256 of
+    source_url). The crawler never creates the index (search-svc owns the mapping).
+    If the broker is not configured or the index is missing, publishing is skipped
+    with a warning and the crawl continues (best-effort, as before).
     """
 
-    BULK_SIZE = 50
-
     def open_spider(self, spider) -> None:  # type: ignore[override]
-        es_url = os.environ.get("ELASTICSEARCH_URL")
+        self.publisher: JobEventPublisher | None = None
         self.es_index = os.environ.get("ELASTICSEARCH_INDEX", "jobs")
-        self._buffer: list[dict] = []
+        if not os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "").strip():
+            logger.warning(
+                "KAFKA_BOOTSTRAP_SERVERS is not set. Job event publishing disabled."
+            )
+            return
+        if not self._index_ready():
+            return
+        # Misconfigured SASL/TLS raises ValueError here and fails the crawl at start.
+        config = producer_config_from_env(os.environ)
+        topic = os.environ.get("KAFKA_TOPIC_JOB_EVENTS", DEFAULT_TOPIC)
+        self.publisher = JobEventPublisher(Producer(config), topic)
+        logger.info(
+            "KafkaJobEventPipeline opened. Topic '%s', index '%s'.",
+            topic,
+            self.es_index,
+        )
+
+    def _index_ready(self) -> bool:
+        """Return True when the ES index exists. The crawler only checks; it never creates."""
+        es_url = os.environ.get("ELASTICSEARCH_URL")
         if not es_url:
             logger.warning(
-                "ELASTICSEARCH_URL is not set. Elasticsearch indexing disabled."
+                "ELASTICSEARCH_URL is not set. Job event publishing disabled (index check)."
             )
-            self.es = None
-            return
+            return False
         try:
             from elasticsearch import Elasticsearch
 
-            self.es = Elasticsearch([es_url])
-            if not self.es.ping():
+            es = Elasticsearch([es_url])
+            if not es.ping():
                 raise ConnectionError("Elasticsearch ping failed.")
-            if index_exists(self.es, self.es_index):
-                logger.info(
-                    "ElasticsearchPipeline opened. Index '%s' ready.", self.es_index
-                )
-            else:
-                self.es = None
+            return index_exists(es, self.es_index)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "ElasticsearchPipeline: connection failed (%s). Indexing disabled.", exc
+                "Elasticsearch index check failed (%s). Job event publishing disabled.",
+                exc,
             )
-            self.es = None
+            return False
 
     def process_item(self, item: dict, spider) -> dict:  # type: ignore[override]
-        if self.es is None:
+        if self.publisher is None:
             title = ItemAdapter(item).get("title", "")
             logger.warning(
-                "Elasticsearch unavailable. Skipping index for item: %s", title
+                "Job event publishing disabled. Skipping publish for item: %s", title
             )
             return item
-        doc = build_es_doc(ItemAdapter(item).asdict())
-        self._buffer.append(
-            {
-                "_index": self.es_index,
-                "_id": doc["id"],  # == job_doc_id(source_url), same as seed_loader
-                "_source": doc,
-            }
-        )
-        if len(self._buffer) >= self.BULK_SIZE:
-            self._flush_buffer()
-        return item
-
-    def _flush_buffer(self) -> None:
-        """Bulk index buffered documents via elasticsearch.helpers.bulk.
-
-        Failed actions are retained in the buffer for retry with the next
-        batch instead of being discarded (PG/ES count parity).
-        """
-        buffer = getattr(self, "_buffer", [])
-        if not buffer or getattr(self, "es", None) is None:
-            return
-        pending = list(buffer)
         try:
-            from elasticsearch.helpers import bulk
-
-            success, errors = bulk(self.es, pending, raise_on_error=False)
-            logger.info("ElasticsearchPipeline bulk indexed %d documents.", success)
-            if errors:
-                failed_ids: set[str] = set()
-                for err in errors:
-                    if isinstance(err, dict):
-                        for op in ("index", "create", "update"):
-                            detail = err.get(op)
-                            if (
-                                isinstance(detail, dict)
-                                and detail.get("_id") is not None
-                            ):
-                                failed_ids.add(str(detail.get("_id")))
-                failed = (
-                    [a for a in pending if str(a.get("_id")) in failed_ids]
-                    if failed_ids
-                    else pending
-                )
-                logger.warning(
-                    "ElasticsearchPipeline bulk errors: %d. %d docs retained.",
-                    len(errors),
-                    len(failed),
-                )
-                buffer.clear()
-                buffer.extend(failed)
-            else:
-                buffer.clear()
+            self.publisher.publish(ItemAdapter(item).asdict())
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "Elasticsearch bulk index failed: %s. %d docs retained for retry.",
+                "Kafka publish failed. source_url=%s Error: %s",
+                ItemAdapter(item).get("source_url"),
                 exc,
-                len(buffer),
             )
+        return item
 
     def close_spider(self, spider) -> None:  # type: ignore[override]
-        self._flush_buffer()
-        remaining = len(getattr(self, "_buffer", []))
-        if remaining:
-            logger.warning(
-                "ElasticsearchPipeline closed with %d unindexed docs.", remaining
-            )
-        if getattr(self, "es", None) is not None:
-            try:
-                self.es.indices.refresh(index=self.es_index)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Elasticsearch refresh failed: %s", exc)
-        logger.info("ElasticsearchPipeline closed.")
+        if self.publisher is None:
+            logger.info("KafkaJobEventPipeline closed (publishing disabled).")
+            return
+        undelivered = self.publisher.flush()
+        logger.info(
+            "KafkaJobEventPipeline closed. delivered=%d failed=%d undelivered=%d.",
+            self.publisher.delivered,
+            self.publisher.failed,
+            undelivered,
+        )

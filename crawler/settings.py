@@ -51,7 +51,7 @@ ITEM_PIPELINES = {
     "crawler.pipelines.CleaningPipeline": 100,
     "crawler.pipelines.DedupPipeline": 200,
     "crawler.pipelines.PostgresPipeline": 300,
-    "crawler.pipelines.ElasticsearchPipeline": 400,
+    "crawler.pipelines.KafkaJobEventPipeline": 400,
 }
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")

@@ -5,12 +5,10 @@ from unittest.mock import MagicMock, patch
 import pytest
 from scrapy.exceptions import DropItem
 
-from crawler.es_document import job_doc_id
 from crawler.items import JobItem
 from crawler.pipelines import (
     CleaningPipeline,
     DedupPipeline,
-    ElasticsearchPipeline,
     PostgresPipeline,
 )
 
@@ -130,27 +128,6 @@ def test_postgres_batch_commit_flushes_every_50():
         assert mock_conn.close.called
 
 
-def test_elasticsearch_bulk_flushes_every_50():
-    mock_es = MagicMock()
-    mock_es.ping.return_value = True
-    mock_es.indices.exists.return_value = True
-    with patch("elasticsearch.Elasticsearch", return_value=mock_es):
-        pipe = ElasticsearchPipeline()
-        pipe.open_spider(spider=None)
-        pipe.es = mock_es
-        with patch("elasticsearch.helpers.bulk", return_value=(50, [])) as mock_bulk:
-            for i in range(55):
-                item = make_item(source_url=f"https://vieclam.gov.vn/seed/{i}")
-                item["pg_id"] = i
-                pipe.process_item(item, spider=None)
-            assert mock_bulk.call_count == 1
-            assert len(pipe._buffer) == 5
-            pipe.close_spider(spider=None)
-            assert mock_bulk.call_count == 2
-            assert len(pipe._buffer) == 0
-            assert mock_es.indices.refresh.called
-
-
 def test_postgres_item_failure_rolls_back_to_savepoint_only():
     mock_conn = make_pg_conn()
     mock_cursor = mock_conn.cursor.return_value
@@ -191,43 +168,3 @@ def test_postgres_batch_commit_failure_resets_batch():
                 )
         assert pipe._batch_count == 0
         assert mock_conn.rollback.called
-
-
-def test_elasticsearch_bulk_exception_retains_buffer_for_retry():
-    mock_es = MagicMock()
-    mock_es.ping.return_value = True
-    mock_es.indices.exists.return_value = True
-    with patch("elasticsearch.Elasticsearch", return_value=mock_es):
-        pipe = ElasticsearchPipeline()
-        pipe.open_spider(spider=None)
-        pipe.es = mock_es
-        for i in range(2):
-            item = make_item(source_url=f"https://vieclam.gov.vn/seed/{i}")
-            item["pg_id"] = i
-            pipe.process_item(item, spider=None)
-        with patch("elasticsearch.helpers.bulk", side_effect=RuntimeError("es down")):
-            pipe._flush_buffer()
-        assert len(pipe._buffer) == 2
-        with patch("elasticsearch.helpers.bulk", return_value=(2, [])):
-            pipe._flush_buffer()
-        assert len(pipe._buffer) == 0
-
-
-def test_elasticsearch_bulk_partial_errors_requeue_failed_only():
-    mock_es = MagicMock()
-    mock_es.ping.return_value = True
-    mock_es.indices.exists.return_value = True
-    with patch("elasticsearch.Elasticsearch", return_value=mock_es):
-        pipe = ElasticsearchPipeline()
-        pipe.open_spider(spider=None)
-        pipe.es = mock_es
-        for i in range(2):
-            item = make_item(source_url=f"https://vieclam.gov.vn/seed/{i}")
-            item["pg_id"] = i
-            pipe.process_item(item, spider=None)
-        failed_id = job_doc_id("https://vieclam.gov.vn/seed/1")
-        errors = [{"index": {"_id": failed_id, "status": 400, "error": "bad doc"}}]
-        with patch("elasticsearch.helpers.bulk", return_value=(1, errors)):
-            pipe._flush_buffer()
-        assert len(pipe._buffer) == 1
-        assert pipe._buffer[0]["_id"] == failed_id

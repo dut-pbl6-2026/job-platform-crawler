@@ -17,6 +17,20 @@ from crawler.es_document import job_doc_id
 from crawler.settings import RETRY_TIMES
 
 ROOT = Path(__file__).resolve().parent.parent
+KAFKA_PAYLOAD_FIELDS = {
+    "jobId",
+    "sourceUrl",
+    "title",
+    "companyName",
+    "location",
+    "salaryMin",
+    "salaryMax",
+    "currency",
+    "description",
+    "requirements",
+    "categoryName",
+    "occurredAt",
+}
 SEARCH_SVC_FIELDS = {
     "id",
     "title",
@@ -79,20 +93,29 @@ def test_crawl_writes_each_unique_job_once_to_pg(crawl):
     assert crawl["stats"]["item_dropped_count"] == 1
 
 
-def test_crawl_es_docs_one_per_job_with_matching_id(crawl):
-    actions = crawl["es_actions"]
-    assert len(actions) == 4
-    ids = [a["_id"] for a in actions]
-    assert len(set(ids)) == 4
-    for action in actions:
-        assert action["_id"] == action["_source"]["id"]
-        assert set(action["_source"]) <= SEARCH_SVC_FIELDS
-        assert action["_source"]["status"] == "Active"
+def test_crawl_publishes_one_event_per_job_keyed_by_job_id(crawl):
+    messages = crawl["kafka_messages"]
+    assert len(messages) == 4
+    assert all(m["topic"] == "job-events" for m in messages)
+    keys = [m["key"] for m in messages]
+    assert len(set(keys)) == 4
+    for message in messages:
+        envelope = message["envelope"]
+        assert envelope["eventType"] == "job.external.upserted"
+        assert envelope["payload"]["jobId"] == message["key"]
+        assert set(envelope["payload"]) <= KAFKA_PAYLOAD_FIELDS
 
 
-def test_crawl_es_ids_match_pg_source_urls(crawl):
+def test_crawl_kafka_keys_match_pg_source_urls(crawl):
     pg_urls = {w["params"]["source_url"] for w in crawl["pg_writes"]}
-    assert {a["_id"] for a in crawl["es_actions"]} == {job_doc_id(u) for u in pg_urls}
+    assert {m["key"] for m in crawl["kafka_messages"]} == {
+        job_doc_id(u) for u in pg_urls
+    }
+
+
+def test_crawl_writes_no_documents_to_elasticsearch_directly(crawl):
+    # Indexing moved to search-svc via job-events; the crawl never bulk-writes ES.
+    assert crawl["es_actions"] == []
 
 
 def test_crawl_salary_from_api_is_parsed_per_real_format(crawl):
