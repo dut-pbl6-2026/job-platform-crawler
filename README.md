@@ -60,8 +60,8 @@ fallback into PG + ES.
 | `verify-500` | `python scripts/verify_500.py` | Verify 500+ dedup in PG + ES |
 
 `output/`, `*.log`, `*.jl` are git-ignored — **never commit live dumps**,
-reproduce with the command above. The only committed sample is the golden
-fixture `tests/fixtures/vieclam_sample.json` (see `tests/fixtures/README.md`).
+reproduce with the command above. The only committed sample captured from the live
+site is the golden fixture `tests/fixtures/vieclam_sample.json` (see `tests/fixtures/README.md`).
 
 ## Contracts (`scrapy check`)
 

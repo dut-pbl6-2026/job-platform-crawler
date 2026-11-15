@@ -3,7 +3,7 @@
 Pipeline chain (priorities defined in settings.py):
   CleaningPipeline (100)      -> strip HTML, normalize salary/location
   DedupPipeline    (200)      -> in-memory dedup per run by source_url
-  PostgresPipeline (300)      -> upsert into crawled_jobs, returns pg_id
+  PostgresPipeline (300)      -> upsert into crawled_jobs (pg_id kept on item)
   ElasticsearchPipeline (400) -> index doc into ES jobs index (best-effort)
 """
 
@@ -11,12 +11,18 @@ import html
 import logging
 import os
 import re
+import unicodedata
+from collections.abc import Mapping
+from decimal import ROUND_HALF_UP, Decimal
 from html.parser import HTMLParser
+from typing import Any
 
 import psycopg2
 import psycopg2.extras
 from itemadapter import ItemAdapter
 from scrapy.exceptions import DropItem, NotConfigured
+
+from crawler.es_document import build_es_doc, index_exists
 
 logger = logging.getLogger("crawler.pipelines")
 
@@ -56,68 +62,103 @@ def _strip_html(raw: str | None) -> str | None:
 # Helper: salary parser
 # ---------------------------------------------------------------------------
 
-# Matches patterns like "5 - 10 trieu", "10tr - 15tr", "15.000.000 - 20.000.000"
-_SALARY_RE = re.compile(
-    r"([\d.,]+)\s*[-\u2013\u2014]\s*([\d.,]+)\s*(trieu|tri\u1ec7u|tri\u1ec7u \u0111\u1ed3ng|tr|million)?",
-    re.IGNORECASE,
+_MILLION = Decimal(1_000_000)
+_UNITS: dict[str, Decimal] = {
+    "trieu": _MILLION,
+    "tr": _MILLION,
+    "million": _MILLION,
+    "ty": Decimal(1_000_000_000),  # ty / tỷ = billion
+}
+_NUM = r"\d+(?:[.,]\d+)*"
+_UNIT = r"(?:trieu|tr|million|ty)(?![a-z])"
+# "from X to Y" with an optional unit after either number: "5 - 10 trieu",
+# "20 den 50 trieu", "5tr - 10tr", "5 trieu - 10 trieu".
+_RANGE_RE = re.compile(
+    rf"(?P<lo>{_NUM})\s*(?P<lo_unit>{_UNIT})?\s*"
+    rf"(?:-|~|\bden\b|\bto\b)\s*"
+    rf"(?P<hi>{_NUM})\s*(?P<hi_unit>{_UNIT})?"
 )
+_SINGLE_RE = re.compile(rf"(?P<val>{_NUM})\s*(?P<unit>{_UNIT})?")
+_MIN_ONLY_RE = re.compile(r"\b(?:tu|tren|hon)\b|>")  # "tu 10 trieu", "tren 10 trieu"
+_MAX_ONLY_RE = re.compile(
+    r"\b(?:duoi|toi|up to)\b|<"
+)  # "duoi 15 trieu", "toi 15 trieu"
+_GROUPED_RE = re.compile(r"\d{1,3}(?:[.,]\d{3})+")  # "15.000.000", "15,000"
 
-# Also match single value "10 trieu"
-_SALARY_SINGLE_RE = re.compile(
-    r"([\d.,]+)\s*(trieu|tri\u1ec7u|tri\u1ec7u \u0111\u1ed3ng|tr|million)?",
-    re.IGNORECASE,
-)
 
-_MILLION = 1_000_000
+def _fold(text: str) -> str:
+    """Lowercase ASCII-fold Vietnamese text: 'Thỏa thuận' -> 'thoa thuan'."""
+    text = text.replace("đ", "d").replace("Đ", "D")
+    decomposed = unicodedata.normalize("NFD", text)
+    stripped = "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
+    return stripped.replace("\xa0", " ").lower()
+
+
+def _decimal(token: str) -> Decimal:
+    """Read a number token. One '.' or ',' is a decimal point; several are thousands separators."""
+    if len(re.findall(r"[.,]", token)) > 1:
+        return Decimal(re.sub(r"[.,]", "", token))
+    return Decimal(token.replace(",", "."))
+
+
+def _amount(token: str, unit: Decimal | None) -> Decimal:
+    """Convert one number token to VND.
+
+    With a unit (triệu, tr, million, tỷ) the number is in that unit and '.'/','
+    are decimal points: '5.5 triệu' -> 5.5M. Without a unit, a grouped number
+    ('15.000.000') is an absolute VND amount; a plain number below 1000 is
+    read as millions (legacy heuristic, e.g. '10 - 20' -> 10M - 20M).
+    """
+    if unit is None and _GROUPED_RE.fullmatch(token):
+        return Decimal(re.sub(r"[.,]", "", token))
+    value = _decimal(token)
+    if unit is not None:
+        return value * unit
+    return value * _MILLION if value < 1000 else value
+
+
+def _to_vnd(value: Decimal) -> int:
+    return int(value.quantize(Decimal(1), rounding=ROUND_HALF_UP))
 
 
 def _parse_salary(salary_raw: str | None) -> tuple[int | None, int | None]:
-    """Parse *salary_raw* into (salary_min, salary_max) VND integers.
+    """Parse *salary_raw* into (salary_min, salary_max) in VND integers.
 
-    Returns (None, None) when salary_raw is blank or unparseable.
-    Converts trieu/tr/million unit to VND by multiplying by 1_000_000.
+    Returns (None, None) for blank, negotiable ('Thoa thuan', 'Thuong luong',
+    'Negotiable' - any text without digits), non-VND ('USD', '$'), or unparseable
+    input. A single amount gives (value, value); 'tu X' / 'tren X' give (X, None);
+    'duoi X' / 'toi X' give (None, X).
     """
-    if not salary_raw:
+    if not salary_raw or not salary_raw.strip():
+        return None, None
+    text = _fold(salary_raw)
+    if not re.search(r"\d", text):
+        return None, None
+    if re.search(r"\$|\busd\b|dollar", text):
         return None, None
 
-    cleaned = salary_raw.strip().replace(",", ".").replace("\xa0", " ")
-
-    m = _SALARY_RE.search(cleaned)
+    m = _RANGE_RE.search(text)
     if m:
-        low_str, high_str, unit = m.group(1), m.group(2), m.group(3)
-        low = _to_int(low_str)
-        high = _to_int(high_str)
-        if unit:
-            low = low * _MILLION if low is not None else None
-            high = high * _MILLION if high is not None else None
-        elif low is not None and low < 1_000:
-            # Heuristic: bare number < 1000 treated as millions
-            low = low * _MILLION
-            high = high * _MILLION if high is not None else None
-        return low, high
+        lo_unit_name = m.group("lo_unit") or m.group("hi_unit")
+        hi_unit_name = m.group("hi_unit") or m.group("lo_unit")
+        lo = _amount(m.group("lo"), _UNITS[lo_unit_name] if lo_unit_name else None)
+        hi = _amount(m.group("hi"), _UNITS[hi_unit_name] if hi_unit_name else None)
+        if lo > hi:
+            lo, hi = hi, lo
+        return _to_vnd(lo), _to_vnd(hi)
 
-    # Single value (e.g. "10 trieu")
-    m2 = _SALARY_SINGLE_RE.search(cleaned)
-    if m2:
-        val_str, unit = m2.group(1), m2.group(2)
-        val = _to_int(val_str)
-        if unit:
-            val = val * _MILLION if val is not None else None
-        elif val is not None and val < 1_000:
-            val = val * _MILLION
-        return val, val
-
-    return None, None
-
-
-def _to_int(s: str) -> int | None:
-    """Convert a numeric string (may contain dots as thousand-separators) to int."""
-    if not s:
-        return None
-    try:
-        return int(float(s.replace(".", "").replace(",", ".")))
-    except ValueError:
-        return None
+    m = _SINGLE_RE.search(text)
+    if not m:
+        return None, None
+    value = _amount(
+        m.group("val"), _UNITS[m.group("unit")] if m.group("unit") else None
+    )
+    amount = _to_vnd(value)
+    if _MIN_ONLY_RE.search(text):
+        return amount, None
+    if _MAX_ONLY_RE.search(text):
+        return None, amount
+    return amount, amount
 
 
 # ---------------------------------------------------------------------------
@@ -178,13 +219,17 @@ CREATE INDEX IF NOT EXISTS idx_crawled_jobs_category ON crawled_jobs(category);
 CREATE INDEX IF NOT EXISTS idx_crawled_jobs_location ON crawled_jobs(location);
 """
 
-_UPSERT_SQL = """
-INSERT INTO crawled_jobs
+# Column list and bind placeholders shared by the crawl upsert and the seed insert.
+_PG_COLUMNS_SQL = """
   (source_url, title, company, location, salary_raw, salary_min, salary_max,
-   salary_currency, description, requirements, category)
+   salary_currency, description, requirements, category)"""
+_PG_VALUES_SQL = """
 VALUES (%(source_url)s, %(title)s, %(company)s, %(location)s, %(salary_raw)s,
         %(salary_min)s, %(salary_max)s, %(salary_currency)s,
-        %(description)s, %(requirements)s, %(category)s)
+        %(description)s, %(requirements)s, %(category)s)"""
+
+_UPSERT_SQL = f"""
+INSERT INTO crawled_jobs{_PG_COLUMNS_SQL}{_PG_VALUES_SQL}
 ON CONFLICT (source_url) DO UPDATE SET
   title       = EXCLUDED.title,
   updated_at  = NOW()
@@ -255,6 +300,23 @@ class DedupPipeline:
 # ---------------------------------------------------------------------------
 
 
+def build_pg_params(adapter: Mapping[str, Any]) -> dict:
+    """Bind parameters for _UPSERT_SQL. Keys must match the %(name)s placeholders."""
+    return {
+        "source_url": adapter.get("source_url"),
+        "title": adapter.get("title") or "",
+        "company": adapter.get("company"),
+        "location": adapter.get("location"),
+        "salary_raw": adapter.get("salary_raw"),
+        "salary_min": adapter.get("salary_min"),
+        "salary_max": adapter.get("salary_max"),
+        "salary_currency": adapter.get("salary_currency", "VND"),
+        "description": adapter.get("description"),
+        "requirements": adapter.get("requirements"),
+        "category": adapter.get("category"),
+    }
+
+
 class PostgresPipeline:
     """Upsert items into PostgreSQL crawled_jobs table (CRAWL-01-04)."""
 
@@ -275,19 +337,7 @@ class PostgresPipeline:
 
     def process_item(self, item: dict, spider) -> dict:  # type: ignore[override]
         adapter = ItemAdapter(item)
-        params = {
-            "source_url": adapter.get("source_url"),
-            "title": adapter.get("title") or "",
-            "company": adapter.get("company"),
-            "location": adapter.get("location"),
-            "salary_raw": adapter.get("salary_raw"),
-            "salary_min": adapter.get("salary_min"),
-            "salary_max": adapter.get("salary_max"),
-            "salary_currency": adapter.get("salary_currency", "VND"),
-            "description": adapter.get("description"),
-            "requirements": adapter.get("requirements"),
-            "category": adapter.get("category"),
-        }
+        params = build_pg_params(adapter)
         try:
             with self.conn.cursor() as cur:
                 cur.execute("SAVEPOINT crawler_batch")
@@ -368,24 +418,6 @@ class PostgresPipeline:
 # ElasticsearchPipeline (priority 400)  -- CRAWL-01-05
 # ---------------------------------------------------------------------------
 
-_ES_MAPPING = {
-    "mappings": {
-        "properties": {
-            "title": {"type": "text"},
-            "company": {"type": "keyword"},
-            "location": {"type": "keyword"},
-            "salary_min": {"type": "long"},
-            "salary_max": {"type": "long"},
-            "salary_currency": {"type": "keyword"},
-            "description": {"type": "text"},
-            "requirements": {"type": "text"},
-            "category": {"type": "keyword"},
-            "source_url": {"type": "keyword"},
-            "crawled_at": {"type": "date"},
-        }
-    }
-}
-
 
 class ElasticsearchPipeline:
     """Index items into Elasticsearch jobs index after PG upsert (CRAWL-01-05).
@@ -412,13 +444,12 @@ class ElasticsearchPipeline:
             self.es = Elasticsearch([es_url])
             if not self.es.ping():
                 raise ConnectionError("Elasticsearch ping failed.")
-            if not self.es.indices.exists(index=self.es_index):
-                self.es.indices.create(index=self.es_index, body=_ES_MAPPING)
-                logger.info("ElasticsearchPipeline: created index '%s'.", self.es_index)
-            else:
+            if index_exists(self.es, self.es_index):
                 logger.info(
                     "ElasticsearchPipeline opened. Index '%s' ready.", self.es_index
                 )
+            else:
+                self.es = None
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "ElasticsearchPipeline: connection failed (%s). Indexing disabled.", exc
@@ -432,25 +463,11 @@ class ElasticsearchPipeline:
                 "Elasticsearch unavailable. Skipping index for item: %s", title
             )
             return item
-        adapter = ItemAdapter(item)
-        pg_id = adapter.get("pg_id")
-        doc = {
-            "title": adapter.get("title"),
-            "company": adapter.get("company"),
-            "location": adapter.get("location"),
-            "salary_min": adapter.get("salary_min"),
-            "salary_max": adapter.get("salary_max"),
-            "salary_currency": adapter.get("salary_currency", "VND"),
-            "description": adapter.get("description"),
-            "requirements": adapter.get("requirements"),
-            "category": adapter.get("category"),
-            "source_url": adapter.get("source_url"),
-            "crawled_at": None,
-        }
+        doc = build_es_doc(ItemAdapter(item).asdict())
         self._buffer.append(
             {
                 "_index": self.es_index,
-                "_id": str(pg_id) if pg_id is not None else None,
+                "_id": doc["id"],  # == job_doc_id(source_url), same as seed_loader
                 "_source": doc,
             }
         )

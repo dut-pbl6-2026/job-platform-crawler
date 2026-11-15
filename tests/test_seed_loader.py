@@ -127,3 +127,28 @@ def test_load_seed_skips_pg_without_url(tmp_path):
             seed_path=seed_path,
         )
     mock_connect.assert_not_called()
+
+
+def test_standalone_script_entry_point_runs():
+    """`python scripts/seed_loader.py` (README, mise `seed`) must import without PYTHONPATH."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("DATABASE_URL_CRAWLER", "ELASTICSEARCH_URL")
+    }
+    result = subprocess.run(
+        [sys.executable, str(root / "scripts" / "seed_loader.py")],
+        cwd=root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "DATABASE_URL_CRAWLER not set" in result.stderr

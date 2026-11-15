@@ -9,9 +9,18 @@ Also called by BlockDetectionMiddleware on consecutive block detection (CRAWL-01
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if (
+    str(_REPO_ROOT) not in sys.path
+):  # `python scripts/seed_loader.py` has no repo root on sys.path
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from dotenv import load_dotenv  # noqa: E402
+
+from crawler.es_document import build_es_doc, index_exists, job_doc_id  # noqa: E402
 
 load_dotenv()
 
@@ -20,7 +29,6 @@ logger = logging.getLogger("crawler.scripts.seed_loader")
 # ---------------------------------------------------------------------------
 # Default seed file path (relative to repo root)
 # ---------------------------------------------------------------------------
-_REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_SEED_PATH = str(_REPO_ROOT / "seed" / "jobs.json")
 
 
@@ -67,39 +75,25 @@ def _insert_pg(records: list[dict], pg_url: str | None) -> None:
 
     import psycopg2
 
-    _CREATE = """
-    CREATE TABLE IF NOT EXISTS crawled_jobs (
-        id              SERIAL       PRIMARY KEY,
-        source_url      TEXT         NOT NULL UNIQUE,
-        title           VARCHAR(256) NOT NULL,
-        company         VARCHAR(256),
-        location        VARCHAR(256),
-        salary_raw      VARCHAR(256),
-        salary_min      BIGINT,
-        salary_max      BIGINT,
-        salary_currency VARCHAR(10)  DEFAULT 'VND',
-        description     TEXT,
-        requirements    TEXT,
-        category        VARCHAR(128),
-        crawled_at      TIMESTAMPTZ  DEFAULT NOW(),
-        updated_at      TIMESTAMPTZ  DEFAULT NOW()
-    );
-    """
-    _INSERT = """
-    INSERT INTO crawled_jobs
-      (source_url, title, company, location, salary_raw, salary_min, salary_max,
-       salary_currency, description, requirements, category)
-    VALUES (%(source_url)s, %(title)s, %(company)s, %(location)s, %(salary_raw)s,
-            %(salary_min)s, %(salary_max)s, %(salary_currency)s,
-            %(description)s, %(requirements)s, %(category)s)
-    ON CONFLICT (source_url) DO NOTHING;
-    """
+    from crawler.pipelines import (
+        _CREATE_TABLE_SQL,
+        _PG_COLUMNS_SQL,
+        _PG_VALUES_SQL,
+        build_pg_params,
+    )
+
+    # Same DDL and columns as PostgresPipeline (single source in pipelines.py).
+    # ON CONFLICT DO NOTHING: seed rows never overwrite crawled rows.
+    _INSERT = (
+        f"INSERT INTO crawled_jobs{_PG_COLUMNS_SQL}{_PG_VALUES_SQL}\n"
+        "ON CONFLICT (source_url) DO NOTHING;"
+    )
 
     try:
         conn = psycopg2.connect(pg_url)
         with conn, conn.cursor() as cur:
-            cur.execute(_CREATE)
-            cur.executemany(_INSERT, records)
+            cur.execute(_CREATE_TABLE_SQL)
+            cur.executemany(_INSERT, [build_pg_params(r) for r in records])
         conn.close()
         logger.info("Loaded %d seed records into PostgreSQL.", len(records))
     except Exception as exc:
@@ -122,26 +116,18 @@ def _index_es(records: list[dict], es_url: str | None, es_index: str) -> None:
         if not es.ping():
             logger.warning("Elasticsearch ping failed -- skipping seed index.")
             return
+        if not index_exists(es, es_index):
+            return
 
+        # Same _id and document shape as ElasticsearchPipeline (crawler/es_document.py):
+        # a seed job and a crawled job with the same source_url are one document.
         actions = [
             {
                 "_index": es_index,
-                "_id": str(r.get("id", i + 1)),
-                "_source": {
-                    "title": r.get("title"),
-                    "company": r.get("company"),
-                    "location": r.get("location"),
-                    "salary_min": r.get("salary_min"),
-                    "salary_max": r.get("salary_max"),
-                    "salary_currency": r.get("salary_currency", "VND"),
-                    "description": r.get("description"),
-                    "requirements": r.get("requirements"),
-                    "category": r.get("category"),
-                    "source_url": r.get("source_url"),
-                    "crawled_at": r.get("crawled_at"),
-                },
+                "_id": job_doc_id(r["source_url"]),
+                "_source": build_es_doc(r),
             }
-            for i, r in enumerate(records)
+            for r in records
         ]
         success_count, _ = bulk(es, actions)
         es.indices.refresh(index=es_index)
