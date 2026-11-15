@@ -1,0 +1,20 @@
+{
+  "eventId": "6f1c2a7e-3b9d-4e8a-9c1f-2d5b7a8e4f10",
+  "eventType": "job.external.upserted",
+  "version": 1,
+  "timestamp": "2026-11-15T08:00:00Z",
+  "payload": {
+    "jobId": "ac95e82c2ab16cff0ed7fab905e6a8c6a2c72dcea530f8cd0f587c36fe9f166a",
+    "sourceUrl": "https://vieclam.gov.vn/search/job-detail?id=101",
+    "title": "Nhan vien kinh doanh",
+    "companyName": "Cong ty ABC",
+    "location": "Ha Noi",
+    "salaryMin": 5500000,
+    "salaryMax": 7000000,
+    "currency": "VND",
+    "description": "Mo ta cong viec",
+    "requirements": null,
+    "categoryName": "Kinh doanh",
+    "occurredAt": "2026-11-15T08:00:00Z"
+  }
+}

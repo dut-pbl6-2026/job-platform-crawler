@@ -1,7 +1,8 @@
 """Run the real VieclamSpider engine against local fixtures, with no network.
 
-Only the I/O edges are faked: psycopg2.connect, elasticsearch.Elasticsearch and
-elasticsearch.helpers.bulk. The pipelines, middlewares, seed loader and spider
+Only the I/O edges are faked: psycopg2.connect, the Kafka producer
+(confluent_kafka.Producer, job-events), elasticsearch.Elasticsearch and
+elasticsearch.helpers.bulk (seed loader only). The pipelines, middlewares, seed loader and spider
 code run unchanged. Requests go to file:// fixtures, a localhost HTTP server
 (403 route), and a closed localhost port (connection refused).
 
@@ -29,6 +30,7 @@ os.environ.update(
         "DATABASE_URL_CRAWLER": "postgresql://fake/fake",
         "ELASTICSEARCH_URL": "http://fake-es:9200",
         "ELASTICSEARCH_INDEX": "jobs",
+        "KAFKA_BOOTSTRAP_SERVERS": "fake-kafka:9092",
         "CRAWLER_TARGET": "https://vieclam.gov.vn",
         "CRAWLER_API_BASE": "https://api.fixture.invalid/webhook",
         "MAX_PAGES": "1",
@@ -43,6 +45,7 @@ os.environ.update(
 PG_WRITES: list[dict] = []
 ES_ACTIONS: list[dict] = []
 ES_CREATED: list[str] = []
+KAFKA_MESSAGES: list[dict] = []
 BLOCK_LOG: list[str] = []
 
 
@@ -120,6 +123,38 @@ def _fake_bulk(client, actions, **kwargs):
     actions = list(actions)
     ES_ACTIONS.extend(actions)
     return len(actions), []
+
+
+class _FakeMessage:
+    def __init__(self, topic: str, key: str) -> None:
+        self._topic = topic
+        self._key = key
+
+    def topic(self) -> str:
+        return self._topic
+
+    def key(self) -> str:
+        return self._key
+
+
+class _FakeKafkaProducer:
+    """Records produced messages and acks each one synchronously (delivery callback)."""
+
+    def __init__(self, config: dict) -> None:
+        self.config = config
+
+    def produce(self, topic: str, key: str, value: str, on_delivery=None) -> None:
+        KAFKA_MESSAGES.append(
+            {"topic": topic, "key": key, "envelope": json.loads(value)}
+        )
+        if on_delivery is not None:
+            on_delivery(None, _FakeMessage(topic, key))
+
+    def poll(self, timeout: float) -> int:
+        return 0
+
+    def flush(self, timeout: float) -> int:
+        return 0
 
 
 class _BlockedHandler(BaseHTTPRequestHandler):
@@ -206,6 +241,7 @@ def main(scenario: str, out_path: str) -> None:
         patch("psycopg2.connect", side_effect=lambda *a, **k: _FakeConn()),
         patch("elasticsearch.Elasticsearch", _FakeES),
         patch("elasticsearch.helpers.bulk", side_effect=_fake_bulk),
+        patch("crawler.pipelines.Producer", _FakeKafkaProducer),
     ):
         process = CrawlerProcess(settings)
         crawler = process.create_crawler(FixtureSpider)
@@ -227,6 +263,7 @@ def main(scenario: str, out_path: str) -> None:
         "pg_writes": PG_WRITES,
         "es_actions": ES_ACTIONS,
         "es_created": ES_CREATED,
+        "kafka_messages": KAFKA_MESSAGES,
         "block_log": BLOCK_LOG,
     }
     Path(out_path).write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")

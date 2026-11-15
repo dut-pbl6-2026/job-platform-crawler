@@ -28,7 +28,8 @@ Agent uses `mise exec -- python ...` / `mise exec -- scrapy ...` due to non-inte
 ```
 crawler/spiders/vieclam_spider.py    -> VieclamSpider: start_urls, parse (pagination), parse_job
 crawler/items.py                     -> JobItem (source_url, title, company, location, salary_raw, description, requirements, category)
-crawler/pipelines.py                 -> CleaningPipeline (100) -> DedupPipeline (200) -> PostgresPipeline (300) -> ElasticsearchPipeline (400)
+crawler/pipelines.py                 -> CleaningPipeline (100) -> DedupPipeline (200) -> PostgresPipeline (300) -> KafkaJobEventPipeline (400)
+crawler/job_events.py                -> job.external.upserted envelope + confluent-kafka publisher (job-events topic)
 crawler/middlewares.py               -> BlockDetectionMiddleware (consecutive 403/429 > 5 -> seed fallback)
 crawler/settings.py                  -> BOT_NAME, DOWNLOAD_DELAY, AUTOTHROTTLE, ROBOTSTXT_OBEY, ITEM_PIPELINES, RETRY_*
 crawler/extensions.py                -> CrawlStatsExtension (summary stats at spider close)
@@ -46,7 +47,7 @@ tests/                               -> pytest unit tests (spider, pipelines, se
 - `CRAWL-01-02` — `CleaningPipeline`: strip HTML tags from `description`/`requirements`, normalize location names (`HCM` -> `Ho Chi Minh`, `HN` -> `Ha Noi`), parse `salary_raw` into `salary_min`/`salary_max` (VND integers), handle missing fields with `None` (no exception).
 - `CRAWL-01-03` — `DedupPipeline`: in-memory `seen_urls` set per run (raise `DropItem` on duplicate). DB-level UNIQUE constraint on `source_url` as safety net across runs.
 - `CRAWL-01-04` — `PostgresPipeline`: `CREATE TABLE IF NOT EXISTS crawled_jobs`, upsert via `ON CONFLICT (source_url) DO UPDATE SET title = EXCLUDED.title, updated_at = NOW()`. Auto-creates table on spider open. Batch commit every 50 items (Day Wed scale-up).
-- `CRAWL-01-05` — `ElasticsearchPipeline`: index document to `jobs` index after successful PG upsert. ES failure logs warning but does NOT abort the crawl (best-effort sync). Bulk indexing via `helpers.bulk` every 50 docs (Day Wed scale-up).
+- `CRAWL-01-05` — `KafkaJobEventPipeline`: after a successful PG upsert, publish one `job.external.upserted` envelope per job to the `job-events` topic, keyed by `jobId` = sha256(`source_url`). search-svc consumes it and indexes the document under the same `_id`; the crawler never writes ES documents. Publishing is skipped with a `[WARNING]` when `KAFKA_BOOTSTRAP_SERVERS` is unset or the `jobs` index is missing (the crawler only checks, never creates). Delivery errors do not abort the crawl.
 - `CRAWL-01-06` — Retry 3 times with exponential backoff on network errors. Log failures with `[WARN]` including URL, HTTP status, and HTML snippet. Continue crawl after individual item failure.
 - `CRAWL-01-07` — `BlockDetectionMiddleware` counts consecutive 403/429 responses. If `consecutive_failures > 5`: log `[WARN] blocked, activating seed fallback`, call `seed_loader.load_seed()`, raise `CloseSpider("blocked_fallback")`. Seed data loaded into PG + ES for uninterrupted demo.
 
@@ -113,7 +114,7 @@ if not DATABASE_URL:
 
 - `.env` is git-ignored. Never commit credentials.
 - Single source of truth: `../job-platform-infra/envs/.env.dev.example` — sync via `mise run sync-env`.
-- Required env vars: `DATABASE_URL_CRAWLER`, `ELASTICSEARCH_URL`, `ELASTICSEARCH_INDEX`, `MAX_PAGES`.
+- Required env vars: `DATABASE_URL_CRAWLER`, `ELASTICSEARCH_URL`, `ELASTICSEARCH_INDEX`, `MAX_PAGES`. Publishing: `KAFKA_BOOTSTRAP_SERVERS` (+ `KAFKA_SASL_*`, `KAFKA_SECURITY_PROTOCOL`, `KAFKA_SSL_CA_LOCATION` as in SharedKernel), optional `KAFKA_TOPIC_JOB_EVENTS` (default `job-events`).
 
 ## Logging conventions
 
