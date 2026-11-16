@@ -17,7 +17,7 @@ Agent uses `mise exec -- python ...` / `mise exec -- scrapy ...` due to non-inte
 
 ## Scope
 
-`PBL6-3` MUST `CRAWL-01` — Extract job listings from `vieclam.gov.vn`, clean and normalize data, deduplicate by `source_url`, persist to PostgreSQL (`crawled_jobs`), sync to Elasticsearch (`jobs` index). Owner TM2 W4 (Sprint Schedule: Day Tue–Wed W4). DB `job_platform_crawler`.
+`PBL6-3` MUST `CRAWL-01` — Extract job listings from `vieclam.gov.vn`, clean and normalize data, deduplicate by `source_url`, persist to PostgreSQL (`crawled_jobs`), and publish `job.external.upserted` to `job-events`; search-svc consumes it and indexes the `jobs` index. Owner TM2 W4 (Sprint Schedule: Day Tue–Wed W4). DB `job_platform_crawler`.
 
 - Day Tue milestone: `COUNT(*) FROM crawled_jobs >= 100` (10 pages, dev mode)
 - Day Wed milestone: `COUNT(*) FROM crawled_jobs >= 500` (50 pages, scale-up, dedup)
@@ -137,11 +137,11 @@ Examples:
 
 ## 2026 best practice
 
-- Python 3.12, Scrapy 2.11, type hints on all public functions.
+- Python 3.12+ (the Docker image uses `python:3.12-slim`), Scrapy 2.13, type hints on all public functions.
 - `ruff check` + `ruff format --check` zero warnings enforced via `mise run verify`.
 - `pytest` coverage > 70% (`MAINT-02`).
 - Never commit `.env` (`.gitignore`).
-- `requirements.txt` with pinned minor versions: `scrapy==2.11.*`, `psycopg2-binary==2.9.*`, `elasticsearch==8.*`, `python-dotenv==1.*`, `ruff==0.4.*`, `pytest==8.*`.
+- `requirements.txt` with pinned minor versions: `scrapy==2.13.*`, `psycopg2-binary==2.9.*`, `elasticsearch==8.*`, `confluent-kafka==2.16.*`, `python-dotenv==1.*`, `ruff==0.4.*`, `pytest==8.*`.
 
 ## Workflow
 
