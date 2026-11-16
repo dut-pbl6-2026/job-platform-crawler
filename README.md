@@ -2,9 +2,9 @@
 
 Web crawler for **Vietnam Job Platform** (`pbl6`) — `dut-pbl6-2026`.
 Extracts job listings from `vieclam.gov.vn` (CRAWL-01-01).
-Target: **500+ deduplicated jobs** in PostgreSQL + Elasticsearch (Day Wed milestone).
+Target: **500+ deduplicated jobs** in PostgreSQL (Day Wed milestone), published on `job-events` and indexed into Elasticsearch by `search-svc`.
 
-- Tech: Python 3.14, Scrapy 2.13
+- Tech: Python 3.12+ (Docker image uses `3.12-slim`), Scrapy 2.13
 - Branch flow: `feature/* → main` (see `job-platform-docs/.github/git-strategy.md`)
 - Jira: Epic `PBL6-3` (Crawler & Data Seeding)
 
@@ -29,8 +29,7 @@ copy .env.example .env  # then fill values; never commit .env
 
 Single source of truth for env values:
 `../job-platform-infra/envs/.env.dev.example`.
-Required: `CRAWLER_TARGET`, `CRAWLER_API_BASE`
-(`DATABASE_URL_CRAWLER` / `ELASTICSEARCH_*` land with PR2 pipelines).
+Required: `CRAWLER_TARGET`, `CRAWLER_API_BASE`. The pipelines also need `DATABASE_URL_CRAWLER`, and the publish step needs `KAFKA_BOOTSTRAP_SERVERS`; `ELASTICSEARCH_URL`/`ELASTICSEARCH_INDEX` are only checked (the crawler never creates or writes the index).
 
 ## Run
 
@@ -68,8 +67,8 @@ site is the golden fixture `tests/fixtures/vieclam_sample.json` (see `tests/fixt
 `parse` / `parse_job` carry `@url` / `@returns` / `@scrapes` contracts
 (HTML GET routes). `parse_api` is intentionally contract-free: the source
 API is POST-only and built-in contracts can only issue GET (verified 404) —
-it is covered by live runs instead. Pipelines land in PR2, so disable them
-for the check:
+it is covered by live runs instead. The pipelines are disabled for the check
+so it needs no database or Kafka:
 
 ```bash
 scrapy check vieclam -s "ITEM_PIPELINES={}"
@@ -81,5 +80,5 @@ Needs `CRAWLER_TARGET` + `CRAWLER_API_BASE` (via `.env` or environment).
 
 ```bash
 ruff check crawler/ tests/
-pytest tests/ -v --tb=short   # from PR2 (pipelines) onwards
+pytest tests/ -v --tb=short
 ```
